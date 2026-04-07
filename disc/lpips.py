@@ -111,44 +111,53 @@ class LPIPS(nnx.Module):
         self._load_pretrained_weights()
 
     def _load_pretrained_weights(self):
-        """Load pretrained VGG LPIPS weights from PyTorch checkpoint."""
+        """Load pretrained VGG LPIPS weights.
+
+        VGG16 features from torchvision, linear layers from LPIPS checkpoint.
+        """
         import torch
+        import torchvision.models as tv_models
 
-        ckpt = get_ckpt_path("vgg_lpips")
-        state = torch.load(ckpt, map_location="cpu")
+        # --- Load VGG16 features from torchvision ---
+        vgg16 = tv_models.vgg16(weights='IMAGENET1K_V1')
+        vgg_state = vgg16.features.state_dict()
 
-        def _t(name):
-            return state[name].detach().cpu().numpy()
+        # Map VGG features to our slice structure
+        # features.0, features.2 → slice0 (conv layers only)
+        # features.5, features.7 → slice1
+        # features.10, features.12, features.14 → slice2
+        # features.17, features.19, features.21 → slice3
+        # features.24, features.26, features.28 → slice4
+        vgg_feat_indices = [
+            ['0', '2'],
+            ['5', '7'],
+            ['10', '12', '14'],
+            ['17', '19', '21'],
+            ['24', '26', '28'],
+        ]
 
-        # Load VGG slices
-        vgg_key_map = {
-            0: [(0, '0'), (1, '2')],       # slice1: features.0, features.2
-            1: [(0, '5'), (1, '7')],        # slice2: features.5, features.7
-            2: [(0, '10'), (1, '12'), (2, '14')],  # slice3
-            3: [(0, '17'), (1, '19'), (2, '21')],  # slice4
-            4: [(0, '24'), (1, '26'), (2, '28')],  # slice5
-        }
-
-        conv_idx = 0
         for slice_idx, s in enumerate(self.net.slices):
-            layer_conv_idx = 0
+            conv_count = 0
             for kind, layer in s.layers:
                 if kind == 'conv':
-                    feat_idx = vgg_key_map[slice_idx][layer_conv_idx][1]
-                    w = _t(f"net.slice{slice_idx + 1}.{feat_idx}.weight")
-                    b = _t(f"net.slice{slice_idx + 1}.{feat_idx}.bias")
+                    feat_idx = vgg_feat_indices[slice_idx][conv_count]
+                    w = vgg_state[f"{feat_idx}.weight"].detach().cpu().numpy()
+                    b = vgg_state[f"{feat_idx}.bias"].detach().cpu().numpy()
                     # PyTorch Conv2d: (out, in, kH, kW) → JAX: (kH, kW, in, out)
                     layer.kernel.value = jnp.array(w.transpose(2, 3, 1, 0))
                     layer.bias.value = jnp.array(b)
-                    layer_conv_idx += 1
+                    conv_count += 1
 
-        # Load linear layers
+        # --- Load LPIPS linear layers ---
+        ckpt = get_ckpt_path("vgg_lpips")
+        lpips_state = torch.load(ckpt, map_location="cpu")
+
         for i, lin in enumerate(self.lins):
-            w = _t(f"lin{i}.model.1.weight")
+            w = lpips_state[f"lin{i}.model.1.weight"].detach().cpu().numpy()
             # PyTorch Conv2d: (out, in, kH, kW) → JAX: (kH, kW, in, out)
             lin.conv.kernel.value = jnp.array(w.transpose(2, 3, 1, 0))
 
-        print(f"[LPIPS] Loaded pretrained weights from {ckpt}")
+        print(f"[LPIPS] Loaded VGG16 from torchvision + LPIPS linears from {ckpt}")
 
     def __call__(self, input: jnp.ndarray, target: jnp.ndarray) -> jnp.ndarray:
         """Compute LPIPS distance.

@@ -122,6 +122,11 @@ def train_step_discriminator(
 # ---------------------------------------------------------------------------
 def train(config):
     """Main training function."""
+    # Force line buffering so prints appear in log file immediately
+    import sys
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+
     # Parse config sections
     rae_cfg, train_cfg, gan_cfg, eval_cfg = parse_configs(config)
 
@@ -291,8 +296,16 @@ def train(config):
                         decoder_params, decoder_opt_state, ema_params,
                         images, rae_model, disc_model, lpips_model, diffaug,
                         gen_optimizer, rng_gen, epoch,
-                        train_cfg.ema_decay, loss_cfg, mesh,
+                        train_cfg.ema_decay,
+                        disc_start=loss_cfg["disc_start"],
+                        lpips_start=loss_cfg["lpips_start"],
+                        perceptual_weight=loss_cfg["perceptual_weight"],
+                        disc_weight_val=loss_cfg["disc_weight"],
+                        mesh=mesh,
                     )
+
+                # Sync decoder params back to model (clears leaked JIT tracers)
+                nnx.update(rae_model.decoder, decoder_params)
 
                 # --- Discriminator step ---
                 disc_loss_val = jnp.zeros(())
@@ -376,24 +389,25 @@ def train(config):
 #   - This ONLY works when running inside `with mesh:` context AND
 #     data is properly sharded via shard_batch().
 # ---------------------------------------------------------------------------
-@jax.jit
+@functools.partial(jax.jit, static_argnames=('rae_model', 'disc_model', 'lpips_model', 'diffaug', 'gen_optimizer', 'ema_decay', 'disc_start', 'lpips_start', 'perceptual_weight', 'disc_weight_val', 'mesh'))
 def train_step_generator_simple(
     decoder_params, decoder_opt_state, ema_params,
     images, rae_model, disc_model, lpips_model, diffaug,
-    gen_optimizer, rng, epoch, ema_decay, loss_cfg, mesh,
+    gen_optimizer, rng, epoch, ema_decay,
+    disc_start, lpips_start, perceptual_weight, disc_weight_val,
+    mesh,
 ):
     """Generator step with mesh-based data parallelism.
 
     Gradient sync: automatic via XLA when data is sharded + params replicated.
     """
-    disc_start = loss_cfg["disc_start"]
-    lpips_start = loss_cfg["lpips_start"]
-    perceptual_weight = loss_cfg["perceptual_weight"]
-    disc_weight_val = loss_cfg["disc_weight"]
 
     rng_noise, rng_aug = jax.random.split(rng)
 
     def loss_fn(dec_params):
+        # Update decoder with current params for gradient tracing
+        nnx.update(rae_model.decoder, dec_params)
+
         z = rae_model.encode(images, rng=rng_noise, training=True)
         x_rec = rae_model.decode(z)
         target = images.transpose(0, 3, 1, 2)
@@ -449,7 +463,7 @@ def train_step_generator_simple(
     return new_params, new_opt_state, new_ema, metrics
 
 
-@jax.jit
+@functools.partial(jax.jit, static_argnames=('disc_model', 'diffaug', 'disc_optimizer', 'loss_type', 'mesh'))
 def train_step_disc_simple(
     disc_params, disc_opt_state,
     real_images, fake_images, disc_model, diffaug,
@@ -462,6 +476,7 @@ def train_step_disc_simple(
     rng_real, rng_fake = jax.random.split(rng)
 
     def disc_loss_fn(d_params):
+        nnx.update(disc_model, d_params)
         real_nchw = real_images.transpose(0, 3, 1, 2)
         real_aug = diffaug(real_nchw, rng_real)
         fake_aug = diffaug(fake_images, rng_fake)

@@ -2,26 +2,43 @@ stage_1:
   target: stage1.RAE
   params:
     encoder_cls: 'Dinov2withNorm'
-    encoder_config_path: 'facebook/dinov2-with-registers-base'
+    encoder_config_path: 'facebook/dinov2-base'
     encoder_input_size: 224
     encoder_params:
-      dinov2_path: 'facebook/dinov2-with-registers-base'
+      dinov2_path: 'facebook/dinov2-base'
       normalize: true
     decoder_config_path: 'configs/decoder/ViTXL'
-    noise_tau: 0.8 # training 0.8, at inference time always set to 0
+    noise_tau: 0.8
     reshape_to_2d: true
-    #normalization_stat_path: 'models/stats/dinov2/wReg_base/imagenet1k/stat.pt'
 
+experiment:
+  results_dir: '/home/ngothanhnam508/RAE/ckpts/stage1'
+  experiment_name: 'celebahq256_dinov2b_decXL'
+
+data:
+  source: 'tfds'
+  dataset_name: 'celebahq256'
+  data_dir: '/home/ngothanhnam508/tensorflow_datasets'
+  tfds_builder_dir: '/home/ngothanhnam508/tensorflow_datasets/celebahq256/1.0.0'
+  image_size: 256
+  num_train_samples: 30000
+
+wandb:
+  enabled: false
+  entity: ''
+  project: 'rae-jax-stage1'
+  experiment_name: 'celebahq256_dinov2b_decXL'
 
 training:
+  seed: 42
   epochs: 16
   ema_decay: 0.9978
-  global_batch_size: 512
+  global_batch_size: 128
   num_workers: 8
   clip_grad: 0.0
-  log_interval: 100
-  checkpoint_interval: 1 # every 1 epoch
-  sample_every: 2500
+  log_interval: 50
+  checkpoint_interval: 1
+  sample_every: 500
   optimizer:
     lr: 2.0e-4
     betas: [0.9, 0.95]
@@ -33,13 +50,6 @@ training:
     base_lr: 2.0e-4
     final_lr: 2.0e-5
     warmup_from_zero: true
-
-# eval:
-#   eval_interval: 2500
-#   eval_model: true
-#   data_path: 'data/imagenet/val/'
-#   reference_npz_path: 'data/imagenet/val_256.npz'
-#   metrics: ['psnr', 'ssim', 'rfid']
 
 gan:
   disc:

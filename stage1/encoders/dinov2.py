@@ -36,7 +36,7 @@ class Dinov2withNorm(nnx.Module):
         self.hf_config = AutoConfig.from_pretrained(dinov2_path)
         self.hidden_size = self.hf_config.hidden_size
         self.patch_size = self.hf_config.patch_size
-        self.num_register_tokens = getattr(self.hf_config, "num_register_tokens", 4)
+        self.num_register_tokens = getattr(self.hf_config, "num_register_tokens", 0)
         self.num_patches = (input_size // self.patch_size) ** 2
 
         # Load the actual Flax model (frozen)
@@ -64,8 +64,9 @@ class Dinov2withNorm(nnx.Module):
         # Normalize with ImageNet mean/std
         x = (x - self.pixel_mean) / self.pixel_std
 
-        # HuggingFace Flax DINOv2 expects (B, H, W, C) — already in NHWC
-        outputs = self._model(pixel_values=x, deterministic=True)
+        # HuggingFace Flax DINOv2 expects NCHW
+        x_nchw = x.transpose(0, 3, 1, 2)  # (B, H, W, C) → (B, C, H, W)
+        outputs = self._model(pixel_values=x_nchw, train=False)
         last_hidden = outputs.last_hidden_state  # (B, 1 + num_register + num_patches, hidden_size)
 
         # Strip CLS token (1) and register tokens
