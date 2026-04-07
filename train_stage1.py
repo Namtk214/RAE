@@ -245,7 +245,7 @@ def train(config):
     disc_opt_state = disc_optimizer.init(disc_params)
 
     # --- Checkpoint ---
-    ckpt_mngr = build_checkpoint_manager(ckpt_dir, max_to_keep=5)
+    ckpt_mngr = build_checkpoint_manager(ckpt_dir, max_to_keep=2)
 
     # Try restore
     ckpt, restored_step = restore_checkpoint(ckpt_mngr)
