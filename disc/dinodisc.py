@@ -181,7 +181,7 @@ class FrozenDINONoDrop(nnx.Module):
         self.embed_dim = cfg["embed_dim"]
         self.img_size = 224
         self.patch_size = cfg["patch_size"]
-        self.key_depths = set(d for d in cfg["key_depths"] if d < cfg["depth"])
+        self.key_depths = frozenset(d for d in cfg["key_depths"] if d < cfg["depth"])
 
         self.patch_embed = PatchEmbed(
             self.img_size, cfg["patch_size"], cfg["in_chans"], cfg["embed_dim"],

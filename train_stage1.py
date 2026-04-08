@@ -244,6 +244,10 @@ def train(config):
     disc_params = nnx.state(disc_model)
     disc_opt_state = disc_optimizer.init(disc_params)
 
+    # Split disc_model into graphdef + state for nnx.merge inside JIT
+    # This avoids TraceContextError when mutating disc_model inside jax.value_and_grad
+    disc_graphdef, _ = nnx.split(disc_model)
+
     # --- Checkpoint ---
     ckpt_mngr = build_checkpoint_manager(ckpt_dir, max_to_keep=2)
 
@@ -253,7 +257,10 @@ def train(config):
     if ckpt is not None:
         decoder_params = ckpt["model"]
         ema_params = ckpt["ema"]
-        decoder_opt_state = ckpt["opt_state"]
+        if "opt_state" in ckpt:
+            decoder_opt_state = ckpt["opt_state"]
+        else:
+            print("[Train] Warning: opt_state not in checkpoint, using freshly initialized optimizer state")
         start_step = restored_step
         print(f"[Train] Resumed from step {start_step}")
 
@@ -275,7 +282,11 @@ def train(config):
         for epoch in range(train_cfg.epochs):
             epoch_start = epoch * steps_per_epoch
             if step >= epoch_start + steps_per_epoch:
+                if epoch < 10 or epoch == train_cfg.epochs - 1:
+                    print(f"[Debug] Skipping epoch {epoch}: step={step} >= epoch_end={epoch_start + steps_per_epoch}", flush=True)
                 continue  # skip completed epochs on resume
+
+            print(f"[Debug] Starting epoch {epoch}: step={step}, epoch_start={epoch_start}", flush=True)
 
             for local_step in range(steps_per_epoch):
                 if step < start_step:
@@ -319,7 +330,7 @@ def train(config):
                     disc_params, disc_opt_state, disc_loss_val = \
                         train_step_disc_simple(
                             disc_params, disc_opt_state,
-                            images, x_rec, disc_model, diffaug,
+                            images, x_rec, disc_graphdef, diffaug,
                             disc_optimizer, rng_disc_step,
                             loss_cfg["disc_loss"], mesh,
                         )
@@ -463,26 +474,32 @@ def train_step_generator_simple(
     return new_params, new_opt_state, new_ema, metrics
 
 
-@functools.partial(jax.jit, static_argnames=('disc_model', 'diffaug', 'disc_optimizer', 'loss_type', 'mesh'))
+@functools.partial(jax.jit, static_argnames=('disc_graphdef', 'diffaug', 'disc_optimizer', 'loss_type', 'mesh'))
 def train_step_disc_simple(
     disc_params, disc_opt_state,
-    real_images, fake_images, disc_model, diffaug,
+    real_images, fake_images, disc_graphdef, diffaug,
     disc_optimizer, rng, loss_type, mesh,
 ):
     """Discriminator step with mesh-based data parallelism.
+
+    Uses nnx.split/merge pattern to avoid mutating disc_model inside
+    jax.value_and_grad (which would cause TraceContextError).
 
     Gradient sync: automatic via XLA (same as generator step).
     """
     rng_real, rng_fake = jax.random.split(rng)
 
     def disc_loss_fn(d_params):
-        nnx.update(disc_model, d_params)
+        # Rebuild a temporary disc model from graphdef + params
+        # This avoids mutating the original disc_model at a different trace level
+        temp_disc = nnx.merge(disc_graphdef, d_params)
+
         real_nchw = real_images.transpose(0, 3, 1, 2)
         real_aug = diffaug(real_nchw, rng_real)
         fake_aug = diffaug(fake_images, rng_fake)
 
-        logits_real = disc_model.classify(real_aug)
-        logits_fake = disc_model.classify(fake_aug)
+        logits_real = temp_disc.classify(real_aug)
+        logits_fake = temp_disc.classify(fake_aug)
 
         if loss_type == "hinge":
             return hinge_d_loss(logits_real, logits_fake)
