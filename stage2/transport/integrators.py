@@ -32,22 +32,41 @@ class sde:
         return x, mean_x
 
     def sample(self, init, model, rng, return_intermediates=False, log_every=10, **model_kwargs):
+        """Euler-Maruyama SDE solver using jax.lax.scan for TPU efficiency."""
         x = init
         mean_x = init
-        samples = []
-        intermediates = [x]
-        for i in range(len(self.t) - 1):
+        t = self.t
+        num_steps = len(t) - 1
+
+        def step_fn(carry, i):
+            x, mean_x, rng = carry
+            t_curr = t[i]
+            t_next = t[i + 1]
             rng, step_rng = jax.random.split(rng)
-            x, mean_x = self._euler_step(x, mean_x, self.t[i], self.t[i + 1], model, step_rng, **model_kwargs)
-            samples.append(x)
-            if return_intermediates and (i + 1) % log_every == 0:
-                intermediates.append(x)
-                
+            noise = jax.random.normal(step_rng, x.shape)
+            dw = noise * jnp.sqrt(jnp.abs(t_curr - t_next))
+            t_vec = jnp.full((x.shape[0],), t_curr)
+            drift = self.drift(x, t_vec, model, **model_kwargs)
+            diffusion = self.diffusion(x, t_vec)
+            mean_x = x - drift * (t_curr - t_next)
+            x = mean_x + jnp.sqrt(2 * diffusion) * dw
+            return (x, mean_x, rng), x
+
+        (x_final, mean_x_final, _), xs = jax.lax.scan(
+            step_fn,
+            (x, mean_x, rng),
+            jnp.arange(num_steps),
+        )
+
         if return_intermediates:
-            if (len(self.t) - 1) % log_every != 0:
-                intermediates.append(x)
-            return samples, intermediates
-        return samples
+            # xs shape: (num_steps, B, C, H, W) — subsample every log_every steps
+            indices = jnp.arange(num_steps)
+            mask = (indices + 1) % log_every == 0
+            intermediates = [xs[i] for i in range(num_steps) if mask[i]]
+            if (num_steps) % log_every != 0:
+                intermediates.append(x_final)
+            return xs, [x] + intermediates
+        return xs
 
 
 class ode:
@@ -63,20 +82,32 @@ class ode:
         self.sampler_type = sampler_type
 
     def sample(self, x, model, return_intermediates=False, log_every=10, **model_kwargs):
-        """Simple Euler ODE solver."""
-        intermediates = [x]
-        for i in range(len(self.t) - 1):
-            t_curr = self.t[i]
-            t_next = self.t[i + 1]
+        """Euler ODE solver using jax.lax.scan for TPU efficiency."""
+        t = self.t
+        num_steps = len(t) - 1
+
+        def step_fn(carry, i):
+            x = carry
+            t_curr = t[i]
+            t_next = t[i + 1]
             dt = t_next - t_curr
             t_vec = jnp.full((x.shape[0],), t_curr)
             v = self.drift(x, t_vec, model, **model_kwargs)
             x = x + v * dt
-            if return_intermediates and (i + 1) % log_every == 0:
-                intermediates.append(x)
-                
+            return x, x
+
+        x_final, xs = jax.lax.scan(
+            step_fn,
+            x,
+            jnp.arange(num_steps),
+        )
+
         if return_intermediates:
-            if (len(self.t) - 1) % log_every != 0:
-                intermediates.append(x)
-            return x, intermediates
-        return x
+            # xs shape: (num_steps, B, C, H, W) — subsample every log_every steps
+            indices = jnp.arange(num_steps)
+            mask = (indices + 1) % log_every == 0
+            intermediates = [xs[i] for i in range(num_steps) if bool(mask[i])]
+            if num_steps % log_every != 0:
+                intermediates.append(x_final)
+            return x_final, [x] + intermediates
+        return x_final

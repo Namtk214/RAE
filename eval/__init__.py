@@ -144,6 +144,12 @@ def evaluate_generation_distributed(
     from tqdm import tqdm
     pbar = tqdm(total=local_num, desc=f"Process {process_index} Generation") if is_main else None
 
+    # Pre-build model fns once (prevents JIT recompile every batch)
+    if use_guidance:
+        _model_fn_cfg = partial(model.forward_with_cfg, cfg_scale=guidance_scale)
+    else:
+        _model_fn = lambda x, t, y: model(x, t, y, training=False)
+
     while generated < local_num:
         # Round up n to be divisible by num_local_devices for clean sharding
         n_raw = min(batch_size, local_num - generated)
@@ -163,17 +169,15 @@ def evaluate_generation_distributed(
             y = jax.device_put(y, data_sharding)
 
         if use_guidance:
-            z = jnp.concatenate([z, z], axis=0)
+            z_cfg = jnp.concatenate([z, z], axis=0)
             y_null = jnp.full((n,), null_label, dtype=jnp.int32)
-            y_guide = jnp.concatenate([y, y_null], axis=0)
-            model_fn_cfg = partial(model.forward_with_cfg, cfg_scale=guidance_scale)
-            samples = sample_fn(z, model_fn_cfg)
+            y_cfg = jnp.concatenate([y, y_null], axis=0)
+            samples = sample_fn(z_cfg, _model_fn_cfg, y=y_cfg)
             if isinstance(samples, (list, tuple)):
                 samples = samples[-1]
             samples = samples[:n]  # Take only conditional half
         else:
-            model_fn = lambda x, t, y: model(x, t, y, training=False)
-            samples = sample_fn(z, model_fn, y=y)
+            samples = sample_fn(z, _model_fn, y=y)
             if isinstance(samples, (list, tuple)):
                 samples = samples[-1]
 
