@@ -74,10 +74,10 @@ def _compute_inception_moments_tf(arr: np.ndarray, batch_size: int):
         tf.config.experimental_connect_to_cluster(resolver)
         tf.tpu.experimental.initialize_tpu_system(resolver)
         strategy = tf.distribute.TPUStrategy(resolver)
-        print("====== [DEBUG FID] Dùng: TENSORFLOW TPU backend ======")
+        # print("====== [DEBUG FID] Dùng: TENSORFLOW TPU backend ======")
     except Exception as e:
         strategy = tf.distribute.get_strategy()  # fallback: CPU / GPU
-        print(f"====== [DEBUG FID] Lỗi khi tạo TPU ({e}) — chạy TF trên default device (CPU/GPU) ======")
+        # print(f"====== [DEBUG FID] Lỗi khi tạo TPU ({e}) — chạy TF trên default device (CPU/GPU) ======")
 
     # Prepare image array: ensure NHWC uint8
     x = arr

@@ -113,7 +113,7 @@ def evaluate_generation_distributed(
     if is_main:
         os.makedirs(temp_dir, exist_ok=True)
         print(f"\n[Eval] Starting distributed generation at step {global_step}")
-        print(f"🚀 [Chẩn đoán FID] Lát nữa FID sẽ được tính bằng backend: {device.upper()}")
+        # print(f"🚀 [Chẩn đoán FID] Lát nữa FID sẽ được tính bằng backend: {device.upper()}")
 
     # Barrier: wait for directory creation
     # On multi-host TPU, use jax.experimental.multihost_utils
