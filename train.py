@@ -53,6 +53,11 @@ def parse_args():
     p.add_argument("--data-path", type=str, required=True)
     p.add_argument("--results-dir", type=str, default="ckpts")
     p.add_argument("--image-size", type=int, default=256)
+    p.add_argument("--dataset-type", type=str, default=None,
+                    choices=["imagefolder", "tfds"],
+                    help="Data source type. Overrides config 'data.source'.")
+    p.add_argument("--tfds-builder-dir", type=str, default=None,
+                    help="Path to custom TFDS builder dir (e.g. tfds_builders/celebahq256).")
     p.add_argument("--wandb", action="store_true")
     p.add_argument("--global-seed", type=int, default=None)
     p.add_argument("--precision", type=str, default="bf16", choices=["fp32", "bf16"])
@@ -187,12 +192,20 @@ def main():
         raise NotImplementedError(f"Sampler mode {sampler_mode}")
 
     # ── Data ──
+    # Read data config from YAML, with CLI args as override
+    data_cfg = OmegaConf.to_container(full_cfg.get("data", {}), resolve=True) if "data" in full_cfg else {}
+    dataset_type = args.dataset_type or data_cfg.get("source", "imagefolder")
+    tfds_builder_dir = args.tfds_builder_dir or data_cfg.get("tfds_builder_dir", None)
+    tfds_name = data_cfg.get("dataset_name", None)
+
     ds, steps_per_epoch = build_dataloader(
         data_path=args.data_path,
         image_size=args.image_size,
         batch_size=global_batch_size,
-        dataset_type="imagefolder",
+        dataset_type=dataset_type,
         split="train",
+        tfds_name=tfds_name,
+        tfds_builder_dir=tfds_builder_dir,
     )
 
     logger.info(f"Steps per epoch: {steps_per_epoch}")

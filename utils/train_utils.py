@@ -62,7 +62,16 @@ def images_to_batch(images: list, image_size: int = 256) -> np.ndarray:
 # Config parsing (OmegaConf compatible)
 # ---------------------------------------------------------------------------
 def parse_configs(config):
-    """Parse YAML config into component sections."""
+    """Parse YAML config into component sections.
+
+    For stage-1 training returns 4 values:
+        (rae_config, training_config, gan_config, eval_config)
+    For stage-2 training returns 8 values:
+        (rae_config, model_config, transport_config, sampler_config,
+         guidance_config, misc_config, training_config, eval_config)
+
+    Auto-detects stage-2 configs by checking for 'stage_2' key.
+    """
     from omegaconf import OmegaConf, DictConfig
 
     if isinstance(config, str):
@@ -70,10 +79,24 @@ def parse_configs(config):
 
     rae_config = config.get("stage_1", None)
     training_config = config.get("training", None)
-    gan_config = config.get("gan", None)
     eval_config = config.get("eval", None)
 
-    return rae_config, training_config, gan_config, eval_config
+    # Stage-2 specific sections
+    model_config = config.get("stage_2", None)
+    transport_config = config.get("transport", None)
+    sampler_config = config.get("sampler", None)
+    guidance_config = config.get("guidance", None)
+    misc_config = config.get("misc", None)
+    data_config = config.get("data", None)
+
+    if model_config is not None:
+        # Stage-2 mode: return all 8 sections
+        return (rae_config, model_config, transport_config, sampler_config,
+                guidance_config, misc_config, training_config, eval_config)
+    else:
+        # Stage-1 mode: return 4 sections (backward compat)
+        gan_config = config.get("gan", None)
+        return rae_config, training_config, gan_config, eval_config
 
 
 def requires_grad(params, flag: bool = True):

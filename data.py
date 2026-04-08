@@ -212,3 +212,82 @@ def build_dataset(
         )
     else:
         raise ValueError(f"Unknown data source: {source}. Use 'tfds' or 'imagefolder'.")
+
+
+# ---------------------------------------------------------------------------
+# Dataloader wrapper — returns (iterator, steps_per_epoch)
+# ---------------------------------------------------------------------------
+def build_dataloader(
+    data_path: str,
+    image_size: int = 256,
+    batch_size: int = 512,
+    dataset_type: str = "imagefolder",
+    split: str = "train",
+    tfds_name: Optional[str] = None,
+    tfds_builder_dir: Optional[str] = None,
+    seed: int = 0,
+    **kwargs,
+) -> Tuple:
+    """Build data iterator and compute steps_per_epoch.
+
+    Args:
+        data_path: Path to image folder OR tfds data_dir.
+        image_size: Target image resolution.
+        batch_size: Global batch size.
+        dataset_type: 'imagefolder' or 'tfds'.
+        split: 'train' or 'validation'.
+        tfds_name: TFDS dataset name (e.g. 'celebahq256'). Used when dataset_type='tfds'.
+        tfds_builder_dir: Path to custom TFDS builder directory.
+        seed: Random seed.
+        **kwargs: Extra args forwarded to underlying builder.
+
+    Returns:
+        (iterator, steps_per_epoch) tuple.
+    """
+    if dataset_type == "imagefolder":
+        # Count images to compute steps_per_epoch
+        data_dir = Path(data_path)
+        extensions = {'.jpg', '.jpeg', '.png', '.JPEG', '.JPG', '.PNG'}
+        num_images = sum(
+            1 for cls_dir in data_dir.iterdir() if cls_dir.is_dir()
+            for img in cls_dir.iterdir() if img.suffix in extensions
+        )
+        steps_per_epoch = num_images // batch_size
+
+        it = build_imagefolder_dataset(
+            data_dir=data_path,
+            image_size=image_size,
+            batch_size=batch_size,
+            seed=seed,
+            **kwargs,
+        )
+        return it, steps_per_epoch
+
+    elif dataset_type == "tfds":
+        import tensorflow_datasets as tfds
+
+        # Determine dataset size for steps_per_epoch
+        if tfds_builder_dir is not None:
+            builder = tfds.builder_from_directory(tfds_builder_dir)
+        else:
+            builder = tfds.builder(tfds_name or "celebahq256", data_dir=data_path)
+
+        info = builder.info
+        num_images = info.splits[split].num_examples
+        steps_per_epoch = num_images // batch_size
+
+        it = build_tfds_dataset(
+            dataset_name=tfds_name or "celebahq256",
+            split=split,
+            image_size=image_size,
+            batch_size=batch_size,
+            seed=seed,
+            data_dir=data_path,
+            tfds_builder_dir=tfds_builder_dir,
+            **kwargs,
+        )
+        return it, steps_per_epoch
+
+    else:
+        raise ValueError(f"Unknown dataset_type: {dataset_type}. Use 'imagefolder' or 'tfds'.")
+
