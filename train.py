@@ -40,7 +40,7 @@ from utils.model_utils import instantiate_from_config
 from utils.train_utils import parse_configs, update_ema, center_crop_arr
 from utils.optim_utils import build_optimizer_with_schedule
 from utils.resume_utils import save_checkpoint, restore_checkpoint, configure_experiment_dirs, build_checkpoint_manager
-from utils.wandb_utils import setup_wandb, log_metrics, log_images
+from utils import wandb_utils
 from data import build_dataloader
 
 
@@ -137,10 +137,11 @@ def main():
 
     # ── WandB ──
     if args.wandb and is_main:
-        setup_wandb(
-            project="rae-jax-stage2",
+        wandb_utils.initialize(
             config=OmegaConf.to_container(full_cfg, resolve=True),
-            name=f"stage2-{Path(args.config).stem}",
+            entity=os.environ.get("ENTITY", ""),
+            exp_name=f"stage2-{Path(args.config).stem}",
+            project_name="rae-jax-stage2",
         )
 
     # ── Seed ──
@@ -355,7 +356,7 @@ def main():
                         + ", ".join(f"{k}: {v:.4f}" for k, v in stats.items())
                     )
                     if args.wandb:
-                        log_metrics(stats, step=global_step)
+                        wandb_utils.log(stats, step=global_step)
 
                     running_loss = 0.0
                     start_time = time.time()
@@ -395,7 +396,7 @@ def main():
                     )
                     if eval_stats and args.wandb and is_main:
                         eval_stats = {f"eval/{k}": v for k, v in eval_stats.items()}
-                        log_metrics(eval_stats, step=global_step)
+                        wandb_utils.log(eval_stats, step=global_step)
 
     # Final checkpoint
     if is_main:
