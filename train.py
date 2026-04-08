@@ -494,6 +494,38 @@ def main():
                    (eval_fid_every > 0 and global_step % eval_fid_every == 0):
                     num_samples = args.num_fid_samples if (eval_fid_every > 0 and global_step % eval_fid_every == 0) else 1000
                     logger.info(f"Starting distributed evaluation ({num_samples} samples)...")
+                    
+                    if reference_npz_path is None:
+                        reference_npz_path = os.path.join(experiment_dir, f"fid_ref_stat_{num_samples}.npz")
+                        
+                    if is_main and not os.path.exists(reference_npz_path):
+                        logger.info(f"Reference NPZ {reference_npz_path} not found. Generating it now via subprocess (to avoid consuming TPU memory)...")
+                        import subprocess
+                        import sys
+                        cmd = [
+                            sys.executable, "create_fid_ref.py",
+                            "--data-path", args.data_path,
+                            "--out-path", reference_npz_path,
+                            "--num-samples", str(num_samples),
+                            "--batch-size", "128",
+                            "--dataset-type", dataset_type
+                        ]
+                        if tfds_name:
+                            cmd.extend(["--tfds-name", tfds_name])
+                        if tfds_builder_dir:
+                            cmd.extend(["--tfds-builder-dir", tfds_builder_dir])
+                            
+                        try:
+                            subprocess.run(cmd, check=True)
+                            logger.info("Reference NPZ generation successful.")
+                        except subprocess.CalledProcessError as e:
+                            logger.error(f"Failed to generate Reference NPZ: {e}")
+                            
+                    try:
+                        jax.experimental.multihost_utils.sync_global_devices("eval_ref_npz_done")
+                    except Exception:
+                        pass
+                        
                     eval_model = nnx.merge(graphdef, ema_state)
                     rae_model_eval = nnx.merge(rae_graphdef, rae_state)
                     
