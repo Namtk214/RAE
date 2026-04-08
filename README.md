@@ -11,17 +11,7 @@ JAX/Flax NNX port of [RAE](https://github.com/bytetriper/RAE), optimized for **T
 ### TPU Setup (Kaggle / GCP)
 
 ```bash
-# JAX + TPU
-pip install jax[tpu] -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
-
-# Core dependencies
-pip install flax optax omegaconf orbax-checkpoint wandb
-
-# Data
-pip install tensorflow tensorflow-datasets Pillow
-
-# Eval (lazy-loaded, only needed at eval time)
-pip install torch torchvision torch-fidelity lpips
+pip install -r requirements.txt
 ```
 
 ### Verify TPU
