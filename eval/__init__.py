@@ -161,7 +161,7 @@ def evaluate_generation_distributed(
     else:
         @jax.jit
         def compiled_sample_fn(z, y):
-            model_fn = lambda x, t, y_in: model(x, t, y_in, training=False)
+            model_fn = lambda x, t, y=None, **kw: model(x, t, y, training=False)
             samples = sample_fn(z, model_fn, y=y)
             if isinstance(samples, (list, tuple)):
                 samples = samples[-1]
