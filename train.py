@@ -362,15 +362,7 @@ def main():
 
     with mesh:
         for epoch in range(num_epochs):
-            # Checkpoint at epoch start
-            if checkpoint_interval > 0 and epoch % checkpoint_interval == 0 and is_main and epoch > 0:
-                logger.info(f"Saving checkpoint at epoch {epoch}...")
-                save_checkpoint(
-                    ckpt_mngr, global_step,
-                    jax.device_get(model_state),
-                    jax.device_get(ema_state),
-                    jax.device_get(opt_state),
-                )
+            # Checkpoint is now saved at step level
 
             if is_main:
                 steps_iter = tqdm(range(steps_per_epoch), desc=f"Epoch {epoch}/{num_epochs}")
@@ -416,6 +408,16 @@ def main():
                         running_stats[f"activations/{k}"] += v
                 
                 global_step += 1
+
+                # Checkpoint at specific global steps
+                if checkpoint_interval > 0 and global_step % checkpoint_interval == 0 and is_main:
+                    logger.info(f"Saving checkpoint at step {global_step}...")
+                    save_checkpoint(
+                        ckpt_mngr, global_step,
+                        jax.device_get(model_state),
+                        jax.device_get(ema_state),
+                        jax.device_get(opt_state),
+                    )
 
                 # Logging — only sync to host every log_interval steps
                 if log_interval > 0 and global_step % log_interval == 0 and is_main:
