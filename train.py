@@ -168,12 +168,15 @@ def main():
 
     # ── Replicate model params across all devices ──
     model_state = nnx.state(model)
-    model_state = jax.device_put(model_state, repl_sharding)
+    # Replicate only array leaves (skip non-array entries like tuples)
+    model_state = jax.tree.map(
+        lambda x: jax.device_put(x, repl_sharding) if hasattr(x, 'shape') else x,
+        model_state,
+    )
     nnx.update(model, model_state)
 
     # ── EMA (replicated) ──
-    ema_state = jax.tree.map(jnp.copy, nnx.state(model))
-    ema_state = jax.device_put(ema_state, repl_sharding)
+    ema_state = jax.tree.map(jnp.copy, model_state)
 
     # ── Optimizer ──
     opt_cfg = training_cfg.get("optimizer", {})
