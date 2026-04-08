@@ -72,7 +72,8 @@ class sde:
                 diffusion = self.diffusion(x, t_vec)
                 mean_x = x - drift * (t_curr - t_next)
                 x = mean_x + jnp.sqrt(2 * diffusion) * dw
-                store = x if (i + 1) % log_every == 0 else jnp.zeros_like(x)
+                # i is a traced value inside scan — must use jnp.where, not Python if/else
+                store = jnp.where((i + 1) % log_every == 0, x, jnp.zeros_like(x))
                 return (x, mean_x, rng), store
 
             (x_final, _, _), xs = jax.lax.scan(
@@ -126,7 +127,8 @@ class ode:
                 t_vec = jnp.full((x.shape[0],), t_curr)
                 v = self.drift(x, t_vec, model, **model_kwargs)
                 x = x + v * dt
-                store = x if (i + 1) % log_every == 0 else jnp.zeros_like(x)
+                # i is a traced value inside scan — must use jnp.where, not Python if/else
+                store = jnp.where((i + 1) % log_every == 0, x, jnp.zeros_like(x))
                 return x, store
 
             x_final, xs = jax.lax.scan(step_fn_full, x, jnp.arange(num_steps))
