@@ -229,6 +229,33 @@ def main():
     logger.info(f"Optimizer: AdamW lr={opt_cfg.get('lr')}, schedule={sched_cfg.get('type')}, "
                 f"warmup={warmup_steps}, total={total_training_steps}")
 
+    # ── Resume from Stage 2 checkpoint if available ──
+    restored_ckpt, restored_step = restore_checkpoint(ckpt_mngr)
+    global_step_resume = 0
+    if restored_ckpt is not None:
+        logger.info(f"Resuming DiT from Stage 2 checkpoint at step {restored_step}...")
+        model_state = jax.device_put(
+            jax.tree.map(lambda x: jnp.array(x) if isinstance(x, np.ndarray) else x, restored_ckpt["model"]),
+            repl_sharding,
+        )
+        ema_state = jax.device_put(
+            jax.tree.map(lambda x: jnp.array(x) if isinstance(x, np.ndarray) else x, restored_ckpt["ema"]),
+            repl_sharding,
+        )
+        if "opt_state" in restored_ckpt:
+            try:
+                opt_state = jax.device_put(
+                    jax.tree.map(lambda x: jnp.array(x) if isinstance(x, np.ndarray) else x, restored_ckpt["opt_state"]),
+                    repl_sharding,
+                )
+                logger.info("Optimizer state restored.")
+            except Exception as e:
+                logger.warning(f"Could not restore optimizer state (will use fresh): {e}")
+        global_step_resume = restored_step
+        logger.info(f"Resumed successfully from step {restored_step}.")
+    else:
+        logger.info("No Stage 2 checkpoint found — starting from scratch with random DiT weights.")
+
     # ── Transport ──
     transport_params = dict(transport_cfg.get("params", {}))
     transport_params.pop("time_dist_shift", None)
@@ -339,7 +366,8 @@ def main():
     eval_fid_every = args.eval_fid_every
 
     # ── Training loop ──
-    global_step = 0
+    global_step = global_step_resume
+    start_epoch = global_step // steps_per_epoch if steps_per_epoch > 0 else 0
     # OPT 4: Accumulate loss as JAX array to avoid per-step host sync
     running_stats = {}
     
@@ -361,7 +389,7 @@ def main():
     model_state = nnx.state(model)
 
     with mesh:
-        for epoch in range(num_epochs):
+        for epoch in range(start_epoch, num_epochs):
             # Checkpoint at epoch start
             if checkpoint_interval > 0 and epoch % checkpoint_interval == 0 and is_main and epoch > 0:
                 logger.info(f"Saving checkpoint at epoch {epoch}...")
