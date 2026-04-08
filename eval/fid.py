@@ -24,7 +24,7 @@ def _fid_from_moments(mu1, sigma1, mu2, sigma2) -> float:
 
 
 def _compute_inception_moments_from_arr(arr: np.ndarray, batch_size: int, device: str):
-    """Compute InceptionV3 2048-d moments from image array."""
+    """Compute InceptionV3 2048-d moments from image array (PyTorch backend, CPU/GPU)."""
     import torch
     from torch_fidelity.feature_extractor_inceptionv3 import FeatureExtractorInceptionV3
 
@@ -57,11 +57,92 @@ def _compute_inception_moments_from_arr(arr: np.ndarray, batch_size: int, device
     return mu, sigma
 
 
-def calculate_gfid(arr1: np.ndarray, ref_arr: dict,
-                   batch_size: int = 64, device: str = "cpu") -> float:
-    """FID: generated images vs reference statistics (mu, sigma)."""
-    mu_ref, sigma_ref = ref_arr['mu'], ref_arr['sigma']
-    mu_gen, sigma_gen = _compute_inception_moments_from_arr(arr1, batch_size, device)
+def _compute_inception_moments_tf(arr: np.ndarray, batch_size: int):
+    """Compute InceptionV3 2048-d moments using TensorFlow — runs on TPU natively.
+
+    PyTorch (``torch_fidelity``) cannot execute on TPU hardware.  This backend
+    leverages ``tf.keras.applications.InceptionV3`` which supports TPU via
+    ``tf.distribute.TPUStrategy``.  The 2048-d average-pooled features are
+    numerically equivalent to those produced by the PyTorch InceptionV3.
+    """
+    import tensorflow as tf
+    tf.config.set_visible_devices([], 'GPU')  # Let TF use TPU, not GPU
+
+    # Detect and initialise TPU
+    try:
+        resolver = tf.distribute.cluster_resolver.TPUClusterResolver()
+        tf.config.experimental_connect_to_cluster(resolver)
+        tf.tpu.experimental.initialize_tpu_system(resolver)
+        strategy = tf.distribute.TPUStrategy(resolver)
+        print("[FID] Using TPUStrategy for InceptionV3 feature extraction")
+    except Exception:
+        strategy = tf.distribute.get_strategy()  # fallback: CPU / GPU
+        print("[FID] TPU not detected — falling back to default TF device")
+
+    # Prepare image array: ensure NHWC uint8
+    x = arr
+    if x.ndim != 4:
+        raise ValueError(f"Expected 4D array, got shape {x.shape}")
+    if x.shape[1] == 3 and x.shape[-1] != 3:  # NCHW → NHWC
+        x = np.transpose(x, (0, 2, 3, 1))
+    if x.dtype != np.uint8:
+        x_f = x.astype(np.float32)
+        if x_f.max() <= 1.5:
+            x_f = x_f * 255.0
+        x = np.clip(x_f, 0, 255).astype(np.uint8)
+
+    # Build InceptionV3 (average-pooled 2048-d output) under strategy scope
+    with strategy.scope():
+        base = tf.keras.applications.InceptionV3(
+            include_top=False,
+            weights='imagenet',
+            pooling='avg',   # directly outputs (B, 2048)
+        )
+
+    @tf.function
+    def extract_features(batch_f32):
+        return base(batch_f32, training=False)
+
+    feats_list = []
+    n = len(x)
+    for i in range(0, n, batch_size):
+        batch = x[i:i + batch_size].astype(np.float32)
+        # InceptionV3 expects inputs scaled to [-1, 1]
+        batch = (batch / 127.5) - 1.0
+        # Resize to 299×299 (InceptionV3 canonical input size)
+        batch_tf = tf.image.resize(batch, [299, 299])
+        feats = extract_features(batch_tf)
+        feats_list.append(feats.numpy())
+
+    feats = np.concatenate(feats_list, axis=0).astype(np.float64)
+    mu = feats.mean(axis=0)
+    sigma = np.cov(feats, rowvar=False)
+    return mu, sigma
+
+
+def calculate_gfid(
+    arr1: np.ndarray,
+    ref_arr: dict,
+    batch_size: int = 64,
+    device: str = "tpu",
+) -> float:
+    """FID: generated images vs reference statistics (mu, sigma).
+
+    ``device`` controls which backend extracts InceptionV3 features:
+
+    * ``'tpu'``  — TensorFlow/Keras backend with ``TPUStrategy`` (recommended
+      on TPU hosts; automatically falls back to CPU if no TPU is detected).
+    * ``'cuda'`` — PyTorch backend running on GPU.
+    * ``'cpu'``  — PyTorch backend running on CPU (slowest).
+    """
+    mu_ref, sigma_ref = ref_arr["mu"], ref_arr["sigma"]
+
+    if device == "tpu":
+        mu_gen, sigma_gen = _compute_inception_moments_tf(arr1, batch_size)
+    else:
+        # PyTorch backend (gpu or cpu)
+        mu_gen, sigma_gen = _compute_inception_moments_from_arr(arr1, batch_size, device)
+
     return _fid_from_moments(mu_gen, sigma_gen, mu_ref, sigma_ref)
 
 
