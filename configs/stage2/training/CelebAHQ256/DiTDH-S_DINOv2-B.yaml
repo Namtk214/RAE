@@ -10,6 +10,7 @@ stage_1:
     decoder_config_path: 'configs/decoder/ViTXL'
     noise_tau: 0.0
     reshape_to_2d: true
+    normalization_stat_path: 'models/stats/dinov2/normalization_stats.npz'
 
 stage_2:
   target: stage2.models.DDT.DiTwDDTHead
