@@ -115,3 +115,18 @@ def _np_to_torch(arr: np.ndarray):
     if x.max() > 1.5:
         x = x / 255.0
     return x
+
+
+class ImgArrDataset:
+    """Torch Dataset wrapper for torch-fidelity: (B, H, W, C) uint8."""
+
+    def __init__(self, arr: np.ndarray):
+        import torch
+        self.arr = arr
+        self._torch = torch
+
+    def __len__(self):
+        return len(self.arr)
+
+    def __getitem__(self, idx):
+        return self._torch.from_numpy(self.arr[idx]).permute(2, 0, 1)

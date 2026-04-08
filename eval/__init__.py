@@ -1,13 +1,15 @@
 """Evaluation package — metrics and distributed eval across TPU cores.
 
-Port of PyTorch distributed evaluation. Supports:
-- evaluate_reconstruction_distributed: encode+decode across all devices, gather on host 0
-- evaluate_generation_distributed: sample across all devices, gather on host 0
-- Both use file-based NPZ shard exchange (same pattern as PyTorch DDP)
+Follows shortcut-models approach:
+- evaluate_generation_distributed: each process generates samples, extracts
+  InceptionV3 activations (JAX-native, on-device), gathers 2048-d activation
+  vectors via process_allgather, host-0 computes µ/Σ and FID.
+- evaluate_reconstruction_distributed: encode+decode across all devices.
+- fid_from_stats uses eye*1e-6 regularization to avoid sqrtm instability.
 """
 
 from .utils import calculate_psnr, calculate_ssim, calculate_lpips
-from .fid import calculate_rfid, calculate_gfid
+from .fid import calculate_rfid, calculate_gfid, fid_from_stats, moments_from_activations, get_fid_network
 
 import os
 import sys
@@ -72,87 +74,72 @@ def evaluate_generation_distributed(
     mesh=None,
     device: str = "tpu",
 ) -> Optional[Dict[str, float]]:
-    """Distributed generation evaluation — each process generates its shard, host 0 computes metrics.
+    """Distributed generation evaluation — shortcut-models style.
 
-    Strategy (mirrors PyTorch DDP):
-    1. Each process generates `chunk = num_samples // num_processes` samples
-    2. Each process saves its shard as NPZ to shared filesystem
-    3. Host 0 combines all shards and computes FID
+    Each process generates samples and extracts InceptionV3 activations
+    on-device (JAX-native). Then activations (2048-d float32) are gathered
+    via process_allgather — much cheaper than gathering full images as NPZ.
+    Host-0 computes µ/Σ and FID using fid_from_stats (with regularization).
 
     Args:
-        model: DiT model
-        ema_state: EMA weights to use for sampling
+        model: DiT model (EMA weights already loaded)
+        ema_state: EMA weights for sampling
         sample_fn: ODE/SDE sampler function
-        latent_size: (C, H, W) latent shape
+        latent_size: (H, W, C) latent shape — NHWC convention
         num_classes: number of classes
         null_label: label for unconditional (usually num_classes)
         use_guidance: whether to use CFG
         guidance_scale: CFG scale
-        num_samples: total samples to generate across all processes
+        num_samples: total samples across all processes
         batch_size: per-device batch size
-        experiment_dir: path for temporary NPZ shards
-        global_step: current training step
-        reference_npz_path: path to reference NPZ for FID
-        rae_decode_fn: optional RAE decode function (latents → images)
+        experiment_dir: path for temp files (not used for image exchange anymore)
+        global_step: current training step (for logging)
+        reference_npz_path: path to reference NPZ with keys 'mu' and 'sigma'
+        rae_decode_fn: optional RAE decode function (latents → NHWC [0,1] images)
         mesh: JAX mesh for sharding
     """
     from flax import nnx
+    from .fid import get_fid_network, preprocess_for_inception, fid_from_stats, moments_from_activations
 
     process_index = jax.process_index()
     num_processes = jax.process_count()
     is_main = process_index == 0
 
-    # Setup data sharding so all cores participate during sampling
+    # Setup sharding
     if mesh is not None:
         data_sharding = NamedSharding(mesh, P("data"))
     else:
         data_sharding = None
 
-    # Create temp directory on host 0
-    temp_dir = os.path.join(experiment_dir, "eval_npzs")
     if is_main:
-        os.makedirs(temp_dir, exist_ok=True)
-        print(f"\n[Eval] Starting distributed generation at step {global_step}")
-        # print(f"🚀 [Chẩn đoán FID] Lát nữa FID sẽ được tính bằng backend: {device.upper()}")
+        print(f"\n[Eval] Starting distributed FID evaluation at step {global_step}")
+        print(f"[Eval] Generating {num_samples} samples, gathering InceptionV3 activations...")
 
-    # Barrier: wait for directory creation
-    # On multi-host TPU, use jax.experimental.multihost_utils
-    try:
-        jax.experimental.multihost_utils.sync_global_devices("eval_dir_create")
-    except Exception:
-        pass  # Single-host: no sync needed
+    # ── Build JAX InceptionV3 (same as shortcut-models) ──
+    # Build once, JIT-compiled — runs fully on TPU/GPU in JAX
+    fid_fn = get_fid_network()
 
-    # Calculate per-process shard
-    chunk = num_samples // num_processes
-    if process_index < num_processes - 1:
-        start, end = process_index * chunk, (process_index + 1) * chunk
-    else:
-        start, end = process_index * chunk, num_samples
-    local_num = end - start
+    @jax.jit
+    def inception_batch(images_nhwc_01):
+        """Resize + scale to [-1,1] + extract 2048-d features in JAX."""
+        # images_nhwc_01: NHWC float32 in [0, 1]
+        x = images_nhwc_01 * 2.0 - 1.0          # → [-1, 1]
+        x = jax.image.resize(
+            x, (x.shape[0], 299, 299, x.shape[3]),
+            method="bilinear", antialias=False,
+        )
+        x = jnp.clip(x, -1.0, 1.0)
+        acts = fid_fn(x)[..., 0, 0, :]           # [B, 2048]
+        return acts
 
-    # The model passed here is usually already configured with the correct weights (e.g. EMA)
-    # in the main training loop, so we do not need to manually swap states here.
-    # We simply use `model` as is.
-
-    # Generate samples
-    generations = []
-    rng = jax.random.PRNGKey(global_step * num_processes + process_index)
-    generated = 0
-
-    num_local_devices = jax.local_device_count()
-
-    from tqdm import tqdm
-    pbar = tqdm(total=local_num, desc=f"Process {process_index} Generation") if is_main else None
-
-    from flax import nnx
-
-    # Pre-build compiled forward functions
+    # Build compiled sampling functions
     if use_guidance:
         @jax.jit
         def compiled_sample_fn(z, y):
             z_cfg = jnp.concatenate([z, z], axis=0)
             y_null = jnp.full((z.shape[0],), null_label, dtype=jnp.int32)
             y_cfg = jnp.concatenate([y, y_null], axis=0)
+            from functools import partial
             model_fn_cfg = partial(model.forward_with_cfg, cfg_scale=guidance_scale)
             samples = sample_fn(z_cfg, model_fn_cfg, y=y_cfg)
             if isinstance(samples, (list, tuple)):
@@ -161,92 +148,104 @@ def evaluate_generation_distributed(
     else:
         @jax.jit
         def compiled_sample_fn(z, y):
-            model_fn = lambda x, t, y=None, **kw: model(x, t, y, training=False)
+            model_fn = lambda x, t, y=None, **kw: model(x, t, y, training=False)  # noqa: E731
             samples = sample_fn(z, model_fn, y=y)
             if isinstance(samples, (list, tuple)):
                 samples = samples[-1]
             return samples
 
+    # ── Per-process shard ──
+    chunk = num_samples // num_processes
+    start = process_index * chunk
+    end = (process_index + 1) * chunk if process_index < num_processes - 1 else num_samples
+    local_num = end - start
+
+    rng = jax.random.PRNGKey(global_step * num_processes + process_index)
+    generated = 0
+    num_local_devices = jax.local_device_count()
+
+    # Collect activations (float32 [N, 2048]) — much smaller than images
+    local_activations = []
+
+    from tqdm import tqdm as _tqdm
+    pbar = _tqdm(total=local_num, desc=f"Process {process_index} Gen+Inception") if is_main else None
+
     while generated < local_num:
-        n_raw = min(batch_size, local_num - generated)  # real samples this iter
+        n_raw = min(batch_size, local_num - generated)
         rng, noise_rng, label_rng = jax.random.split(rng, 3)
 
-        # Always generate a FULL batch_size to keep compiled_sample_fn shape stable
-        # (avoids JIT recompilation on the last smaller batch).
+        # Always full batch_size to keep JIT shape stable
         z = jax.random.normal(noise_rng, (batch_size, *latent_size))
         y = jax.random.randint(label_rng, (batch_size,), 0, num_classes)
 
-        # Shard z and y across all local devices so every core participates
         if data_sharding is not None and batch_size % num_local_devices == 0:
             z = jax.device_put(z, data_sharding)
             y = jax.device_put(y, data_sharding)
 
+        # Sample latents
         samples = compiled_sample_fn(z, y)
-        samples = samples[:n_raw]  # Discard padding, keep only real samples
+        samples = samples[:n_raw]
 
-        # Decode latents → images (if RAE provided)
+        # Decode latents → images [0, 1] NHWC
         if rae_decode_fn is not None:
             images = rae_decode_fn(samples)
             images = jnp.clip(images, 0.0, 1.0)
         else:
             images = jnp.clip(samples, 0.0, 1.0)
 
-        # Convert to uint8 NHWC
-        imgs_np = np.array(images)
-        if imgs_np.ndim == 4 and imgs_np.shape[1] in (1, 3, 4):  # NCHW → NHWC
-            imgs_np = np.transpose(imgs_np, (0, 2, 3, 1))
-        imgs_uint8 = (imgs_np * 255).astype(np.uint8)
-        generations.append(imgs_uint8)
-        generated += n_raw
+        # Ensure NHWC (decode might return NCHW)
+        if images.ndim == 4 and images.shape[1] in (1, 3, 4) and images.shape[-1] not in (1, 3, 4):
+            images = jnp.transpose(images, (0, 2, 3, 1))
 
+        # Extract InceptionV3 activations ON-DEVICE (JAX JIT)
+        acts = inception_batch(images)  # [n_raw, 2048]
+        local_activations.append(np.array(acts))
+
+        generated += n_raw
         if pbar is not None:
             pbar.update(n_raw)
 
     if pbar is not None:
         pbar.close()
 
+    # Stack local activations: [local_num, 2048]
+    local_acts = np.concatenate(local_activations, axis=0)  # [local_num, 2048]
     if is_main:
-        print(f"[Process {process_index}] Generated {generated} samples")
+        print(f"[Process {process_index}] Collected {local_acts.shape[0]} activations, shape {local_acts.shape}")
 
-    generations = np.concatenate(generations, axis=0)
-
-    # Save shard NPZ
-    shard_path = os.path.join(temp_dir, f"gen_{global_step:07d}_{process_index:02d}.npz")
-    np.savez(shard_path, arr_0=generations)
-
-    # Restore original weights is skipped since we didn't swap anything (model is already cloned for eval).
-
-    # Barrier: wait for all processes
+    # ── Gather activations across all processes (shortcut-models style) ──
+    # process_allgather gathers along a new leading axis → [num_processes, local_num, 2048]
+    # then reshape to [total_samples, 2048]
     try:
-        jax.experimental.multihost_utils.sync_global_devices("eval_gen_done")
-    except Exception:
-        pass
+        all_acts = jax.experimental.multihost_utils.process_allgather(
+            jnp.array(local_acts)
+        )
+        all_acts = np.array(all_acts)
+        # Shape: [num_processes, local_num, 2048] → [num_processes * local_num, 2048]
+        if all_acts.ndim == 3:
+            all_acts = all_acts.reshape(-1, all_acts.shape[-1])
+        all_acts = all_acts[:num_samples]  # trim to exact num_samples
+    except Exception as e:
+        # Single-host fallback: local_acts is already all we have
+        if is_main:
+            print(f"[Eval] process_allgather not available ({e}), using local activations only.")
+        all_acts = local_acts
 
-    # Host 0 computes metrics
+    # ── Host 0 computes FID ──
     metrics = None
     if is_main:
-        all_gens = []
-        for r in range(num_processes):
-            shard_file = os.path.join(temp_dir, f"gen_{global_step:07d}_{r:02d}.npz")
-            shard_data = np.load(shard_file)["arr_0"]
-            all_gens.append(shard_data)
-
-        combined = np.concatenate(all_gens, axis=0)[:num_samples]
-        print(f"[Eval] Combined generation shape: {combined.shape}")
+        print(f"[Eval] Combined activations shape: {all_acts.shape}")
 
         if reference_npz_path and os.path.exists(reference_npz_path):
-            ref_stats = np.load(reference_npz_path)
-            metrics = compute_generation_metrics(ref_stats, combined, 128, device=device)
-            print(f"[Eval] Step {global_step} — FID: {metrics.get('fid', -1):.4f}")
+            ref = np.load(reference_npz_path)
+            mu_ref, sigma_ref = ref["mu"], ref["sigma"]
+            mu_gen, sigma_gen = moments_from_activations(all_acts)
+            fid_score = fid_from_stats(mu_gen, sigma_gen, mu_ref, sigma_ref)
+            metrics = {"fid": fid_score}
+            print(f"[Eval] Step {global_step} — FID: {fid_score:.4f}")
         else:
             print(f"[Eval] No reference NPZ found at {reference_npz_path}")
             metrics = {"fid": -1.0}
-
-        # Cleanup
-        for r in range(num_processes):
-            shard_file = os.path.join(temp_dir, f"gen_{global_step:07d}_{r:02d}.npz")
-            if os.path.exists(shard_file):
-                os.remove(shard_file)
 
     # Final barrier
     try:
@@ -255,6 +254,7 @@ def evaluate_generation_distributed(
         pass
 
     return metrics
+
 
 
 # ---------------------------------------------------------------------------
