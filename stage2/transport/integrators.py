@@ -13,7 +13,7 @@ class sde:
     def __init__(self, drift, diffusion, *, t0, t1, num_steps, sampler_type, time_dist_shift):
         assert t0 < t1
         self.num_timesteps = num_steps
-        t = np.linspace(t0, t1, num_steps)
+        t = np.linspace(t0, t1, num_steps + 1)  # num_steps+1 points → num_steps intervals
         t = 1 - t
         t = time_dist_shift * t / (1 + (time_dist_shift - 1) * t)
         self.t = jnp.array(t, dtype=jnp.float32)
@@ -83,7 +83,8 @@ class sde:
             intermediates = [xs[i] for i in indices]
             if num_steps % log_every != 0:
                 intermediates.append(x_final)
-            return x_final, [init] + intermediates
+            # Does NOT include initial noise — starts from first real denoising step
+            return x_final, intermediates
 
 
 class ode:
@@ -92,7 +93,7 @@ class ode:
     def __init__(self, drift, *, t0, t1, sampler_type, num_steps, atol, rtol, time_dist_shift):
         assert t0 < t1
         self.drift = drift
-        t = np.linspace(t0, t1, num_steps)
+        t = np.linspace(t0, t1, num_steps + 1)  # num_steps+1 points → num_steps intervals
         t = 1 - t
         t = time_dist_shift * t / (1 + (time_dist_shift - 1) * t)
         self.t = jnp.array(t, dtype=jnp.float32)
@@ -136,4 +137,5 @@ class ode:
             intermediates = [xs[i] for i in indices]
             if num_steps % log_every != 0:
                 intermediates.append(x_final)
-            return x_final, [x] + intermediates
+            # Return (x_final, intermediates) — intermediates does NOT include initial noise
+            return x_final, intermediates

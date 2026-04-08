@@ -188,17 +188,6 @@ class GaussianFourierEmbedding(nnx.Module):
         self.mlp_1 = nnx.Linear(hidden_size, hidden_size, use_bias=True, dtype=dtype, rngs=rngs)
 
     def __call__(self, t: jnp.ndarray) -> jnp.ndarray:
-        # t: (B,)
-        W = jax.lax.stop_gradient(self.W.value)
-        t_proj = t[:, None] * W[None, :] * 2 * jnp.pi
-        t_embed = jnp.concatenate([jnp.sin(t_proj), jnp.cos(t_proj)], axis=-1)
-        return jax.nn.silu(self.mlp_0(t_embed))
-        # Note: matching PyTorch which is Sequential(Linear, SiLU, Linear)
-        # but we only apply SiLU after first linear here, final linear below
-        # Actually PyTorch code does mlp = Sequential(Linear, SiLU, Linear)
-        # So: h = silu(linear1(t_embed)); out = linear2(h)
-
-    def __call__(self, t: jnp.ndarray) -> jnp.ndarray:
         W = jax.lax.stop_gradient(self.W.value)
         t_proj = t[:, None] * W[None, :] * 2 * jnp.pi
         t_embed = jnp.concatenate([jnp.sin(t_proj), jnp.cos(t_proj)], axis=-1)

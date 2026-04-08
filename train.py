@@ -373,11 +373,13 @@ def main():
                 )
 
             if is_main:
-                steps_iter = tqdm(ds, total=steps_per_epoch, desc=f"Epoch {epoch}/{num_epochs}")
+                steps_iter = tqdm(range(steps_per_epoch), desc=f"Epoch {epoch}/{num_epochs}")
             else:
-                steps_iter = ds
+                steps_iter = range(steps_per_epoch)
 
-            for step_data in steps_iter:
+            for _ in steps_iter:
+                step_data = next(ds)
+
                 # OPT 5: Shard image batch directly without intermediate jnp.array()
                 images = jax.device_put(
                     jnp.asarray(step_data["image"]), data_sharding
@@ -578,34 +580,45 @@ def _generate_samples(graphdef, ema_state, sample_fn, latent_size,
 
     ema_model = nnx.merge(graphdef, ema_state)
 
+    log_every = 10
     if use_guidance:
-        z = jnp.concatenate([z, z], axis=0)
+        z_in = jnp.concatenate([z, z], axis=0)
         y = labels[:n]
         y_null = jnp.full((n,), null_label, dtype=jnp.int32)
-        y = jnp.concatenate([y, y_null], axis=0)
-        samples, intermediates = sample_fn(z, partial(ema_model.forward_with_cfg, cfg_scale=cfg_scale), return_intermediates=True, log_every=10)
-    else:
-        y = labels[:n]
-        model_fn = lambda x, t, y: ema_model(x, t, y, training=False)
-        samples, intermediates = sample_fn(z, model_fn, y=y, return_intermediates=True, log_every=10)
-
-    if use_guidance:
+        y_in = jnp.concatenate([y, y_null], axis=0)
+        samples, intermediates = sample_fn(
+            z_in, partial(ema_model.forward_with_cfg, cfg_scale=cfg_scale),
+            return_intermediates=True, log_every=log_every,
+        )
         samples = samples[:n]
         intermediates = [step[:n] for step in intermediates]
+    else:
+        y = labels[:n]
+        # Use y=None, **kw to match transport.py drift convention (passes y as keyword)
+        model_fn = lambda x, t, y=None, **kw: ema_model(x, t, y, training=False)
+        samples, intermediates = sample_fn(
+            z, model_fn, y=y,
+            return_intermediates=True, log_every=log_every,
+        )
 
     if rae_decode_fn is not None and use_wandb:
-        print(f"Decoding {len(intermediates)} intermediate steps for WandB...")
+        num_inter = len(intermediates)
+        print(f"Decoding {num_inter} intermediate denoising steps for WandB...")
+
         for idx, inter_z in enumerate(intermediates):
+            # intermediates[0] = after step log_every, [1] = 2*log_every, ...
+            ode_step = (idx + 1) * log_every
             images = np.array(rae_decode_fn(inter_z))
             images = np.clip(images, 0.0, 1.0)
-            if images.ndim == 4 and images.shape[1] in (1, 3, 4):
+            if images.ndim == 4 and images.shape[1] in (1, 3, 4):  # NCHW -> NHWC
                 images = np.transpose(images, (0, 2, 3, 1))
             wandb_utils.log_image(
-                images, 
-                key=f"sample_denoise/step_{idx*10}", 
+                images,
+                key=f"sample_denoise/step_{ode_step:03d}",
                 step=global_step,
             )
-            
+
+        # Log final clean sample
         final_images = np.array(rae_decode_fn(samples))
         final_images = np.clip(final_images, 0.0, 1.0)
         if final_images.ndim == 4 and final_images.shape[1] in (1, 3, 4):
