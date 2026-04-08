@@ -17,6 +17,7 @@ from typing import Dict, Optional, Tuple
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.sharding import NamedSharding, PartitionSpec as P
 
 
 # ---------------------------------------------------------------------------
@@ -99,6 +100,12 @@ def evaluate_generation_distributed(
     num_processes = jax.process_count()
     is_main = process_index == 0
 
+    # Setup data sharding so all cores participate during sampling
+    if mesh is not None:
+        data_sharding = NamedSharding(mesh, P("data"))
+    else:
+        data_sharding = None
+
     # Create temp directory on host 0
     temp_dir = os.path.join(experiment_dir, "eval_npzs")
     if is_main:
@@ -129,15 +136,28 @@ def evaluate_generation_distributed(
     rng = jax.random.PRNGKey(global_step * num_processes + process_index)
     generated = 0
 
+    num_local_devices = jax.local_device_count()
+
     from tqdm import tqdm
     pbar = tqdm(total=local_num, desc=f"Process {process_index} Generation") if is_main else None
 
     while generated < local_num:
-        n = min(batch_size, local_num - generated)
+        # Round up n to be divisible by num_local_devices for clean sharding
+        n_raw = min(batch_size, local_num - generated)
+        n = ((n_raw + num_local_devices - 1) // num_local_devices) * num_local_devices
+        n = min(n, local_num - generated)  # don't overshoot total
+        # If n < num_local_devices, just use n_raw (edge case at the end)
+        if n == 0:
+            n = n_raw
         rng, noise_rng, label_rng = jax.random.split(rng, 3)
 
         z = jax.random.normal(noise_rng, (n, *latent_size))
         y = jax.random.randint(label_rng, (n,), 0, num_classes)
+
+        # Shard z and y across all local devices so every core participates
+        if data_sharding is not None and n % num_local_devices == 0:
+            z = jax.device_put(z, data_sharding)
+            y = jax.device_put(y, data_sharding)
 
         if use_guidance:
             z = jnp.concatenate([z, z], axis=0)
