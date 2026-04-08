@@ -38,35 +38,51 @@ class sde:
         t = self.t
         num_steps = len(t) - 1
 
-        def step_fn(carry, i):
-            x, mean_x, rng = carry
-            t_curr = t[i]
-            t_next = t[i + 1]
-            rng, step_rng = jax.random.split(rng)
-            noise = jax.random.normal(step_rng, x.shape)
-            dw = noise * jnp.sqrt(jnp.abs(t_curr - t_next))
-            t_vec = jnp.full((x.shape[0],), t_curr)
-            drift = self.drift(x, t_vec, model, **model_kwargs)
-            diffusion = self.diffusion(x, t_vec)
-            mean_x = x - drift * (t_curr - t_next)
-            x = mean_x + jnp.sqrt(2 * diffusion) * dw
-            return (x, mean_x, rng), x
+        if not return_intermediates:
+            # Fast path: only return final state, no intermediate storage
+            def step_fn(carry, i):
+                x, mean_x, rng = carry
+                t_curr = t[i]
+                t_next = t[i + 1]
+                rng, step_rng = jax.random.split(rng)
+                noise = jax.random.normal(step_rng, x.shape)
+                dw = noise * jnp.sqrt(jnp.abs(t_curr - t_next))
+                t_vec = jnp.full((x.shape[0],), t_curr)
+                drift = self.drift(x, t_vec, model, **model_kwargs)
+                diffusion = self.diffusion(x, t_vec)
+                mean_x = x - drift * (t_curr - t_next)
+                x = mean_x + jnp.sqrt(2 * diffusion) * dw
+                return (x, mean_x, rng), None  # None = don't accumulate output
 
-        (x_final, mean_x_final, _), xs = jax.lax.scan(
-            step_fn,
-            (x, mean_x, rng),
-            jnp.arange(num_steps),
-        )
+            (x_final, _, _), _ = jax.lax.scan(
+                step_fn, (x, mean_x, rng), jnp.arange(num_steps)
+            )
+            return x_final
+        else:
+            # Slow path: collect intermediates (only for visualization)
+            def step_fn_full(carry, i):
+                x, mean_x, rng = carry
+                t_curr = t[i]
+                t_next = t[i + 1]
+                rng, step_rng = jax.random.split(rng)
+                noise = jax.random.normal(step_rng, x.shape)
+                dw = noise * jnp.sqrt(jnp.abs(t_curr - t_next))
+                t_vec = jnp.full((x.shape[0],), t_curr)
+                drift = self.drift(x, t_vec, model, **model_kwargs)
+                diffusion = self.diffusion(x, t_vec)
+                mean_x = x - drift * (t_curr - t_next)
+                x = mean_x + jnp.sqrt(2 * diffusion) * dw
+                store = x if (i + 1) % log_every == 0 else jnp.zeros_like(x)
+                return (x, mean_x, rng), store
 
-        if return_intermediates:
-            # xs shape: (num_steps, B, C, H, W) — subsample every log_every steps
-            indices = jnp.arange(num_steps)
-            mask = (indices + 1) % log_every == 0
-            intermediates = [xs[i] for i in range(num_steps) if mask[i]]
-            if (num_steps) % log_every != 0:
+            (x_final, _, _), xs = jax.lax.scan(
+                step_fn_full, (x, mean_x, rng), jnp.arange(num_steps)
+            )
+            indices = [i for i in range(num_steps) if (i + 1) % log_every == 0]
+            intermediates = [xs[i] for i in indices]
+            if num_steps % log_every != 0:
                 intermediates.append(x_final)
-            return xs, [x] + intermediates
-        return xs
+            return x_final, [init] + intermediates
 
 
 class ode:
@@ -86,28 +102,36 @@ class ode:
         t = self.t
         num_steps = len(t) - 1
 
-        def step_fn(carry, i):
-            x = carry
-            t_curr = t[i]
-            t_next = t[i + 1]
-            dt = t_next - t_curr
-            t_vec = jnp.full((x.shape[0],), t_curr)
-            v = self.drift(x, t_vec, model, **model_kwargs)
-            x = x + v * dt
-            return x, x
+        if not return_intermediates:
+            # Fast path: scan with no output accumulation → minimal memory
+            def step_fn(carry, i):
+                x = carry
+                t_curr = t[i]
+                t_next = t[i + 1]
+                dt = t_next - t_curr
+                t_vec = jnp.full((x.shape[0],), t_curr)
+                v = self.drift(x, t_vec, model, **model_kwargs)
+                x = x + v * dt
+                return x, None  # None = don't accumulate
 
-        x_final, xs = jax.lax.scan(
-            step_fn,
-            x,
-            jnp.arange(num_steps),
-        )
+            x_final, _ = jax.lax.scan(step_fn, x, jnp.arange(num_steps))
+            return x_final
+        else:
+            # Slow path: collect intermediates every log_every steps
+            def step_fn_full(carry, i):
+                x = carry
+                t_curr = t[i]
+                t_next = t[i + 1]
+                dt = t_next - t_curr
+                t_vec = jnp.full((x.shape[0],), t_curr)
+                v = self.drift(x, t_vec, model, **model_kwargs)
+                x = x + v * dt
+                store = x if (i + 1) % log_every == 0 else jnp.zeros_like(x)
+                return x, store
 
-        if return_intermediates:
-            # xs shape: (num_steps, B, C, H, W) — subsample every log_every steps
-            indices = jnp.arange(num_steps)
-            mask = (indices + 1) % log_every == 0
-            intermediates = [xs[i] for i in range(num_steps) if bool(mask[i])]
+            x_final, xs = jax.lax.scan(step_fn_full, x, jnp.arange(num_steps))
+            indices = [i for i in range(num_steps) if (i + 1) % log_every == 0]
+            intermediates = [xs[i] for i in indices]
             if num_steps % log_every != 0:
                 intermediates.append(x_final)
             return x_final, [x] + intermediates
-        return x_final

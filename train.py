@@ -544,7 +544,7 @@ def main():
                         use_guidance=use_guidance,
                         guidance_scale=guidance_scale,
                         num_samples=num_samples,
-                        batch_size=per_device_batch,
+                        batch_size=min(per_device_batch * 4, 512),  # 4x bigger for eval throughput
                         experiment_dir=experiment_dir,
                         global_step=global_step,
                         reference_npz_path=reference_npz_path,

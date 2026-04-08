@@ -144,42 +144,45 @@ def evaluate_generation_distributed(
     from tqdm import tqdm
     pbar = tqdm(total=local_num, desc=f"Process {process_index} Generation") if is_main else None
 
-    # Pre-build model fns once (prevents JIT recompile every batch)
+    from flax import nnx
+
+    # Pre-build compiled forward functions
     if use_guidance:
-        _model_fn_cfg = partial(model.forward_with_cfg, cfg_scale=guidance_scale)
+        @jax.jit
+        def compiled_sample_fn(z, y):
+            z_cfg = jnp.concatenate([z, z], axis=0)
+            y_null = jnp.full((z.shape[0],), null_label, dtype=jnp.int32)
+            y_cfg = jnp.concatenate([y, y_null], axis=0)
+            model_fn_cfg = partial(model.forward_with_cfg, cfg_scale=guidance_scale)
+            samples = sample_fn(z_cfg, model_fn_cfg, y=y_cfg)
+            if isinstance(samples, (list, tuple)):
+                samples = samples[-1]
+            return samples[:z.shape[0]]
     else:
-        _model_fn = lambda x, t, y: model(x, t, y, training=False)
+        @jax.jit
+        def compiled_sample_fn(z, y):
+            model_fn = lambda x, t, y_in: model(x, t, y_in, training=False)
+            samples = sample_fn(z, model_fn, y=y)
+            if isinstance(samples, (list, tuple)):
+                samples = samples[-1]
+            return samples
 
     while generated < local_num:
-        # Round up n to be divisible by num_local_devices for clean sharding
-        n_raw = min(batch_size, local_num - generated)
-        n = ((n_raw + num_local_devices - 1) // num_local_devices) * num_local_devices
-        n = min(n, local_num - generated)  # don't overshoot total
-        # If n < num_local_devices, just use n_raw (edge case at the end)
-        if n == 0:
-            n = n_raw
+        n_raw = min(batch_size, local_num - generated)  # real samples this iter
         rng, noise_rng, label_rng = jax.random.split(rng, 3)
 
-        z = jax.random.normal(noise_rng, (n, *latent_size))
-        y = jax.random.randint(label_rng, (n,), 0, num_classes)
+        # Always generate a FULL batch_size to keep compiled_sample_fn shape stable
+        # (avoids JIT recompilation on the last smaller batch).
+        z = jax.random.normal(noise_rng, (batch_size, *latent_size))
+        y = jax.random.randint(label_rng, (batch_size,), 0, num_classes)
 
         # Shard z and y across all local devices so every core participates
-        if data_sharding is not None and n % num_local_devices == 0:
+        if data_sharding is not None and batch_size % num_local_devices == 0:
             z = jax.device_put(z, data_sharding)
             y = jax.device_put(y, data_sharding)
 
-        if use_guidance:
-            z_cfg = jnp.concatenate([z, z], axis=0)
-            y_null = jnp.full((n,), null_label, dtype=jnp.int32)
-            y_cfg = jnp.concatenate([y, y_null], axis=0)
-            samples = sample_fn(z_cfg, _model_fn_cfg, y=y_cfg)
-            if isinstance(samples, (list, tuple)):
-                samples = samples[-1]
-            samples = samples[:n]  # Take only conditional half
-        else:
-            samples = sample_fn(z, _model_fn, y=y)
-            if isinstance(samples, (list, tuple)):
-                samples = samples[-1]
+        samples = compiled_sample_fn(z, y)
+        samples = samples[:n_raw]  # Discard padding, keep only real samples
 
         # Decode latents → images (if RAE provided)
         if rae_decode_fn is not None:
@@ -194,10 +197,10 @@ def evaluate_generation_distributed(
             imgs_np = np.transpose(imgs_np, (0, 2, 3, 1))
         imgs_uint8 = (imgs_np * 255).astype(np.uint8)
         generations.append(imgs_uint8)
-        generated += n
-        
+        generated += n_raw
+
         if pbar is not None:
-            pbar.update(n)
+            pbar.update(n_raw)
 
     if pbar is not None:
         pbar.close()
