@@ -167,13 +167,9 @@ def main():
     logger.info(f"DiT parameters: {model_param_count / 1e6:.2f}M")
 
     # ── Replicate model params across all devices ──
-    model_state = nnx.state(model)
-    # Replicate only array leaves (skip non-array entries like tuples)
-    model_state = jax.tree.map(
-        lambda x: jax.device_put(x, repl_sharding) if hasattr(x, 'shape') else x,
-        model_state,
-    )
-    nnx.update(model, model_state)
+    # Use split/merge to properly separate graph structure from state
+    graphdef, model_state = nnx.split(model)
+    model_state = jax.device_put(model_state, repl_sharding)
 
     # ── EMA (replicated) ──
     ema_state = jax.tree.map(jnp.copy, model_state)
@@ -257,12 +253,12 @@ def main():
         """
 
         def loss_fn(params):
-            # Temporarily set model state for forward pass
-            nnx.update(model, params)
+            # Reconstruct model from graphdef + params for forward pass
+            m = nnx.merge(graphdef, params)
             rng_local = step_rng
 
             def model_forward(xt, t, y):
-                return model(xt, t, y, training=True, rng=rng_local)
+                return m(xt, t, y, training=True, rng=rng_local)
 
             terms = transport.training_losses(
                 model_forward, batch_x, step_rng, y=batch_y,
@@ -367,9 +363,8 @@ def main():
                 # Visual sampling
                 if sample_every > 0 and global_step % sample_every == 0 and is_main:
                     logger.info("Generating EMA samples...")
-                    nnx.update(model, model_state)
                     _generate_samples(
-                        model, ema_state, eval_sample_fn,
+                        graphdef, ema_state, eval_sample_fn,
                         latent_size, labels[:8], rng,
                         use_guidance, guidance_scale, null_label,
                         global_step, args.wandb,
@@ -378,10 +373,10 @@ def main():
                 # Distributed eval
                 if do_eval and eval_interval > 0 and global_step % eval_interval == 0:
                     logger.info("Starting distributed evaluation...")
-                    nnx.update(model, model_state)
+                    eval_model = nnx.merge(graphdef, ema_state)
                     from eval import evaluate_generation_distributed
                     eval_stats = evaluate_generation_distributed(
-                        model=model,
+                        model=eval_model,
                         ema_state=ema_state,
                         sample_fn=eval_sample_fn,
                         latent_size=latent_size,
@@ -414,7 +409,7 @@ def main():
     logger.info("Training complete!")
 
 
-def _generate_samples(model, ema_state, sample_fn, latent_size,
+def _generate_samples(graphdef, ema_state, sample_fn, latent_size,
                       labels, rng, use_guidance, cfg_scale, null_label,
                       global_step, use_wandb):
     """Generate visual samples using EMA model (on main process only)."""
@@ -422,9 +417,8 @@ def _generate_samples(model, ema_state, sample_fn, latent_size,
     rng, noise_rng = jax.random.split(rng)
     z = jax.random.normal(noise_rng, (n, *latent_size))
 
-    # Swap in EMA weights temporarily
-    orig_state = jax.tree.map(jnp.copy, nnx.state(model))
-    nnx.update(model, ema_state)
+    # Reconstruct model with EMA weights
+    ema_model = nnx.merge(graphdef, ema_state)
 
     if use_guidance:
         z = jnp.concatenate([z, z], axis=0)
@@ -432,25 +426,17 @@ def _generate_samples(model, ema_state, sample_fn, latent_size,
         y_null = jnp.full((n,), null_label, dtype=jnp.int32)
         y = jnp.concatenate([y, y_null], axis=0)
 
-        samples = sample_fn(z, partial(model.forward_with_cfg, cfg_scale=cfg_scale))
+        samples = sample_fn(z, partial(ema_model.forward_with_cfg, cfg_scale=cfg_scale))
     else:
         y = labels[:n]
-        model_fn = lambda x, t, y_: model(x, t, y_, training=False)
+        model_fn = lambda x, t, y_: ema_model(x, t, y_, training=False)
         samples = sample_fn(z, model_fn, y=y)
 
     if use_guidance:
         samples = samples[:n]
 
-    # Restore original weights
-    nnx.update(model, orig_state)
-
     # Note: RAE decode requires the decoder to be loaded
-    # For now just log that samples were generated
     print(f"Generated {n} latent samples at step {global_step}")
-    # if rae decoder is available:
-    # images = rae.decode(samples)
-    # if use_wandb:
-    #     log_images(images, global_step)
 
 
 if __name__ == "__main__":
