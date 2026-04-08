@@ -98,20 +98,26 @@ class Transport:
         t = self.time_dist_shift * t / (1 + (self.time_dist_shift - 1) * t)
         return t, x0, x1
 
-    def training_losses(self, model_fn, x1, rng, **model_kwargs):
+    def training_losses(self, model_fn, x1, rng, has_aux=False, **model_kwargs):
         """Compute flow matching training loss.
 
         Args:
-            model_fn: callable (xt, t, **kwargs) → predicted output
+            model_fn: callable (xt, t, **kwargs) → predicted output or (output, aux)
             x1: data samples
             rng: PRNG key
+            has_aux: whether model_fn returns aux data
 
         Returns:
-            dict with 'loss' and 'pred' keys
+            dict with 'loss' and 'pred' keys, optionally tuple (dict, aux) if has_aux
         """
         t, x0, x1 = self.sample(x1, rng)
         t, xt, ut = self.path_sampler.plan(t, x0, x1)
-        model_output = model_fn(xt, t, **model_kwargs)
+        
+        if has_aux:
+            model_output, aux = model_fn(xt, t, **model_kwargs)
+        else:
+            model_output = model_fn(xt, t, **model_kwargs)
+            aux = None
 
         terms = {"pred": model_output}
         if self.model_type == ModelType.VELOCITY:
@@ -132,7 +138,7 @@ class Transport:
             else:
                 terms["loss"] = mean_flat(weight * (model_output * sigma_t + x0) ** 2)
 
-        return terms
+        return terms if not has_aux else (terms, aux)
 
     def get_drift(self):
         """Get drift function for ODE/SDE sampling."""

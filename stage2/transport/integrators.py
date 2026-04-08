@@ -31,14 +31,22 @@ class sde:
         x = mean_x + jnp.sqrt(2 * diffusion) * dw
         return x, mean_x
 
-    def sample(self, init, model, rng, **model_kwargs):
+    def sample(self, init, model, rng, return_intermediates=False, log_every=10, **model_kwargs):
         x = init
         mean_x = init
         samples = []
+        intermediates = [x]
         for i in range(len(self.t) - 1):
             rng, step_rng = jax.random.split(rng)
             x, mean_x = self._euler_step(x, mean_x, self.t[i], self.t[i + 1], model, step_rng, **model_kwargs)
             samples.append(x)
+            if return_intermediates and (i + 1) % log_every == 0:
+                intermediates.append(x)
+                
+        if return_intermediates:
+            if (len(self.t) - 1) % log_every != 0:
+                intermediates.append(x)
+            return samples, intermediates
         return samples
 
 
@@ -54,8 +62,9 @@ class ode:
         self.t = jnp.array(t, dtype=jnp.float32)
         self.sampler_type = sampler_type
 
-    def sample(self, x, model, **model_kwargs):
+    def sample(self, x, model, return_intermediates=False, log_every=10, **model_kwargs):
         """Simple Euler ODE solver."""
+        intermediates = [x]
         for i in range(len(self.t) - 1):
             t_curr = self.t[i]
             t_next = self.t[i + 1]
@@ -63,4 +72,11 @@ class ode:
             t_vec = jnp.full((x.shape[0],), t_curr)
             v = self.drift(x, t_vec, model, **model_kwargs)
             x = x + v * dt
+            if return_intermediates and (i + 1) % log_every == 0:
+                intermediates.append(x)
+                
+        if return_intermediates:
+            if (len(self.t) - 1) % log_every != 0:
+                intermediates.append(x)
+            return x, intermediates
         return x

@@ -151,20 +151,25 @@ class LightningDiT(nnx.Module):
         x = jnp.transpose(x, (0, 5, 1, 3, 2, 4))
         return x.reshape(x.shape[0], c, h * p, w * p)
 
-    def __call__(self, x, t, y, training=True, rng=None):
+    def __call__(self, x, t, y, training=True, rng=None, return_activations=False):
         x = self.x_embedder(x) + self.pos_embed.value
         t_emb = self.t_embedder(t)
         y_emb = self.y_embedder(y, training=training, rng=rng)
         c = t_emb + y_emb
 
-        for block in self.blocks:
+        activations = {}
+        for i, block in enumerate(self.blocks):
             x = block(x, c, feat_rope=self.feat_rope)
+            if return_activations:
+                activations[f"block_{i}"] = jnp.sqrt(jnp.mean(jnp.square(x)))
 
         x = self.final_layer(x, c)
         x = self.unpatchify(x)
 
         if self.learn_sigma:
             x = x[:, :self.in_channels]
+        if return_activations:
+            return x, activations
         return x
 
     def forward_with_cfg(self, x, t, y, cfg_scale, cfg_interval=(0.0, 1.0)):

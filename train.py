@@ -62,6 +62,8 @@ def parse_args():
     p.add_argument("--wandb", action="store_true")
     p.add_argument("--global-seed", type=int, default=None)
     p.add_argument("--precision", type=str, default="bf16", choices=["fp32", "bf16"])
+    p.add_argument("--eval-fid-every", type=int, default=0, help="Evaluate FID with samples every N steps")
+    p.add_argument("--num-fid-samples", type=int, default=50000, help="Number of samples for FID")
     return p.parse_args()
 
 
@@ -232,6 +234,15 @@ def main():
         tfds_name=tfds_name,
         tfds_builder_dir=tfds_builder_dir,
     )
+    ds_valid, _ = build_dataloader(
+        data_path=args.data_path,
+        image_size=args.image_size,
+        batch_size=global_batch_size,
+        dataset_type=dataset_type,
+        split="validation" if dataset_type == "tfds" else "val",
+        tfds_name=tfds_name,
+        tfds_builder_dir=tfds_builder_dir,
+    )
 
     logger.info(f"Steps per epoch: {steps_per_epoch}")
     logger.info(f"Global batch: {global_batch_size}, Per-device: {per_device_batch}")
@@ -256,22 +267,20 @@ def main():
     # ─────────────────────────────────────────────────────────────
     @partial(jax.jit, donate_argnums=(0, 1, 2))
     def train_step(model_state, opt_state, ema_state, batch_x, batch_y, step_rng):
-        """Single training step — fully on-device, no Python sync.
-
-        Returns (loss_scalar, new_model_state, new_opt_state, new_ema_state)
-        where loss_scalar is a JAX array (not Python float) to avoid sync.
-        """
+        """Single training step — fully on-device, no Python sync."""
 
         def loss_fn(params):
             m = nnx.merge(graphdef, params)
             def model_forward(xt, t, y):
-                return m(xt, t, y, training=True, rng=step_rng)
-            terms = transport.training_losses(
-                model_forward, batch_x, step_rng, y=batch_y,
+                return m(xt, t, y, training=True, rng=step_rng, return_activations=True)
+            
+            terms, acts = transport.training_losses(
+                model_forward, batch_x, step_rng, has_aux=True, y=batch_y,
             )
-            return jnp.mean(terms["loss"])
+            v_mag = jnp.sqrt(jnp.mean(jnp.square(terms["pred"])))
+            return jnp.mean(terms["loss"]), (v_mag, acts)
 
-        loss, grads = jax.value_and_grad(loss_fn)(model_state)
+        (loss, (v_mag, acts)), grads = jax.value_and_grad(loss_fn, has_aux=True)(model_state)
 
         # OPT 3: Gradient norm fully on-device (no Python list comprehension)
         if clip_grad > 0:
@@ -294,18 +303,30 @@ def main():
             ema_state, new_model_state,
         )
 
-        return loss, new_model_state, new_opt_state, new_ema
+        return loss, new_model_state, new_opt_state, new_ema, v_mag, acts
 
     # ── Eval ──
     eval_cfg = OmegaConf.to_container(eval_config or {}, resolve=True) if eval_config else {}
     do_eval = bool(eval_cfg)
     eval_interval = int(eval_cfg.get("eval_interval", 0))
     reference_npz_path = eval_cfg.get("reference_npz_path", None)
+    eval_fid_every = args.eval_fid_every
 
     # ── Training loop ──
     global_step = 0
     # OPT 4: Accumulate loss as JAX array to avoid per-step host sync
-    running_loss = jnp.zeros(())
+    running_stats = {}
+    
+    @jax.jit
+    def valid_step(model_state, batch_x, batch_y, step_rng):
+        def loss_fn(params):
+            m = nnx.merge(graphdef, params)
+            def model_forward(xt, t, y):
+                return m(xt, t, y, training=False, rng=step_rng)
+            terms = transport.training_losses(model_forward, batch_x, step_rng, y=batch_y)
+            return jnp.mean(terms["loss"])
+        return loss_fn(model_state)
+
     start_time = time.time()
 
     logger.info(f"Starting training for {num_epochs} epochs...")
@@ -344,52 +365,107 @@ def main():
 
                 rng, step_rng = jax.random.split(rng)
 
-                loss, model_state, opt_state, ema_state = train_step(
+                loss, model_state, opt_state, ema_state, v_mag, acts = train_step(
                     model_state, opt_state, ema_state,
                     latents, labels, step_rng,
                 )
 
                 # OPT 4: accumulate on-device, only sync at log boundary
-                running_loss = running_loss + loss
+                if "loss" not in running_stats:
+                    running_stats["loss"] = loss
+                    running_stats["v_magnitude_prime"] = v_mag
+                    for k, v in acts.items():
+                        running_stats[f"activations/{k}"] = v
+                else:
+                    running_stats["loss"] += loss
+                    running_stats["v_magnitude_prime"] += v_mag
+                    for k, v in acts.items():
+                        running_stats[f"activations/{k}"] += v
+                
                 global_step += 1
 
                 # Logging — only sync to host every log_interval steps
                 if log_interval > 0 and global_step % log_interval == 0 and is_main:
-                    avg_loss = float(running_loss) / log_interval  # single sync here
+                    avg_stats = {k: float(v) / log_interval for k, v in running_stats.items()}
                     elapsed = time.time() - start_time
                     steps_per_sec = log_interval / elapsed
+                    
+                    # Compute validation loss on current validation batch
+                    try:
+                        valid_data = next(ds_valid)
+                    except TypeError:
+                        # Sometimes iterators need iter()
+                        if not hasattr(ds_valid, "__next__"):
+                            ds_valid = iter(ds_valid)
+                        try:
+                            valid_data = next(ds_valid)
+                        except StopIteration:
+                            ds_valid = iter(ds_valid)
+                            valid_data = next(ds_valid)
+                    
+                    valid_images = jax.device_put(jnp.asarray(valid_data["image"]), data_sharding)
+                    valid_label_np = valid_data.get("label", None)
+                    if valid_label_np is not None:
+                        valid_labels = jax.device_put(jnp.asarray(valid_label_np), data_sharding)
+                    else:
+                        valid_labels = jax.device_put(jnp.zeros(valid_images.shape[0], dtype=jnp.int32), data_sharding)
+                        
+                    rng, val_rng = jax.random.split(rng)
+                    valid_latents = encode_batch(rae_state, valid_images, val_rng)
+                    loss_valid = float(valid_step(model_state, valid_latents, valid_labels, val_rng))
 
                     stats = {
-                        "train/loss": avg_loss,
-                        "train/steps_per_sec": steps_per_sec,
-                        "train/epoch": epoch,
-                        "train/lr": float(optimizer.learning_rate(opt_state[1].count)
+                        "training/loss": avg_stats["loss"],
+                        "training/loss_valid": loss_valid,
+                        "training/v_magnitude_prime": avg_stats["v_magnitude_prime"],
+                        "training/steps_per_sec": steps_per_sec,
+                        "training/epoch": epoch,
+                        "training/lr": float(optimizer.learning_rate(opt_state[1].count)
                                           if hasattr(optimizer, 'learning_rate') else opt_cfg.get("lr", 2e-4)),
                     }
+                    for k, v in avg_stats.items():
+                        if k.startswith("activations/"):
+                            stats[f"training/{k}"] = v
+                            
                     logger.info(
                         f"[Epoch {epoch} | Step {global_step}] "
-                        + ", ".join(f"{k}: {v:.4f}" for k, v in stats.items())
+                        + ", ".join(f"{k.split('/')[-1]}: {v:.4f}" for k, v in stats.items())
                     )
                     if args.wandb:
                         wandb_utils.log(stats, step=global_step)
 
-                    running_loss = jnp.zeros(())
+                    running_stats = {}
                     start_time = time.time()
 
                 # Visual sampling
                 if sample_every > 0 and global_step % sample_every == 0 and is_main:
                     logger.info("Generating EMA samples...")
+                    rae_model_gen = nnx.merge(rae_graphdef, rae_state)
+                    # Helper decode function for denoise visualization
+                    @jax.jit
+                    def decode_fn(z):
+                        return jax.lax.stop_gradient(rae_model_gen.decode(z, training=False))
+
                     _generate_samples(
                         graphdef, ema_state, eval_sample_fn,
                         latent_size, labels[:8], rng,
                         use_guidance, guidance_scale, null_label,
                         global_step, args.wandb,
+                        rae_decode_fn=decode_fn
                     )
 
                 # Distributed eval
-                if do_eval and eval_interval > 0 and global_step % eval_interval == 0:
-                    logger.info("Starting distributed evaluation...")
+                if (do_eval and eval_interval > 0 and global_step % eval_interval == 0) or \
+                   (eval_fid_every > 0 and global_step % eval_fid_every == 0):
+                    num_samples = args.num_fid_samples if (eval_fid_every > 0 and global_step % eval_fid_every == 0) else 1000
+                    logger.info(f"Starting distributed evaluation ({num_samples} samples)...")
                     eval_model = nnx.merge(graphdef, ema_state)
+                    rae_model_eval = nnx.merge(rae_graphdef, rae_state)
+                    
+                    @jax.jit
+                    def eval_decode_fn(z):
+                        return jax.lax.stop_gradient(rae_model_eval.decode(z, training=False))
+                        
                     from eval import evaluate_generation_distributed
                     eval_stats = evaluate_generation_distributed(
                         model=eval_model,
@@ -400,11 +476,12 @@ def main():
                         null_label=null_label,
                         use_guidance=use_guidance,
                         guidance_scale=guidance_scale,
-                        num_samples=1000,
+                        num_samples=num_samples,
                         batch_size=per_device_batch,
                         experiment_dir=experiment_dir,
                         global_step=global_step,
                         reference_npz_path=reference_npz_path,
+                        rae_decode_fn=eval_decode_fn,
                         mesh=mesh,
                     )
                     if eval_stats and args.wandb and is_main:
@@ -426,7 +503,7 @@ def main():
 
 def _generate_samples(graphdef, ema_state, sample_fn, latent_size,
                       labels, rng, use_guidance, cfg_scale, null_label,
-                      global_step, use_wandb):
+                      global_step, use_wandb, rae_decode_fn=None):
     """Generate visual samples using EMA model (on main process only)."""
     n = min(8, labels.shape[0])
     rng, noise_rng = jax.random.split(rng)
@@ -439,14 +516,34 @@ def _generate_samples(graphdef, ema_state, sample_fn, latent_size,
         y = labels[:n]
         y_null = jnp.full((n,), null_label, dtype=jnp.int32)
         y = jnp.concatenate([y, y_null], axis=0)
-        samples = sample_fn(z, partial(ema_model.forward_with_cfg, cfg_scale=cfg_scale))
+        samples, intermediates = sample_fn(z, partial(ema_model.forward_with_cfg, cfg_scale=cfg_scale), return_intermediates=True, log_every=10)
     else:
         y = labels[:n]
         model_fn = lambda x, t, y: ema_model(x, t, y, training=False)
-        samples = sample_fn(z, model_fn, y=y)
+        samples, intermediates = sample_fn(z, model_fn, y=y, return_intermediates=True, log_every=10)
 
     if use_guidance:
         samples = samples[:n]
+        intermediates = [step[:n] for step in intermediates]
+
+    if rae_decode_fn is not None and use_wandb:
+        print(f"Decoding {len(intermediates)} intermediate steps for WandB...")
+        for idx, inter_z in enumerate(intermediates):
+            images = np.array(rae_decode_fn(inter_z))
+            images = np.clip(images, 0.0, 1.0)
+            if images.ndim == 4 and images.shape[1] in (1, 3, 4):
+                images = np.transpose(images, (0, 2, 3, 1))
+            wandb_utils.log_image(
+                images, 
+                key=f"sample_denoise/step_{idx*10}", 
+                step=global_step,
+            )
+            
+        final_images = np.array(rae_decode_fn(samples))
+        final_images = np.clip(final_images, 0.0, 1.0)
+        if final_images.ndim == 4 and final_images.shape[1] in (1, 3, 4):
+            final_images = np.transpose(final_images, (0, 2, 3, 1))
+        wandb_utils.log_image(final_images, key="sample/final", step=global_step)
 
     print(f"Generated {n} latent samples at step {global_step}")
 

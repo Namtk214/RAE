@@ -289,7 +289,8 @@ class DiTwDDTHead(nnx.Module):
         s: Optional[jnp.ndarray] = None,
         training: bool = True,
         rng: Optional[jax.random.PRNGKey] = None,
-    ) -> jnp.ndarray:
+        return_activations: bool = False,
+    ) -> Union[jnp.ndarray, Tuple[jnp.ndarray, dict]]:
         """Forward pass.
 
         Args:
@@ -308,6 +309,7 @@ class DiTwDDTHead(nnx.Module):
         y_emb = self.y_embedder(y, training=training, rng=rng)
         c = jax.nn.silu(t_emb + y_emb)
 
+        activations = {}
         if s is None:
             # Encoder path
             s = self.s_embedder(x)
@@ -316,6 +318,8 @@ class DiTwDDTHead(nnx.Module):
 
             for i in range(self.num_encoder_blocks):
                 s = self.blocks[i](s, c, feat_rope=self.enc_rope)
+                if return_activations:
+                    activations[f"encoder_block_{i}"] = jnp.sqrt(jnp.mean(jnp.square(s)))
 
             # Broadcast t to spatial dims and combine
             t_broadcast = t_emb[:, None, :].repeat(s.shape[1], axis=1)
@@ -330,10 +334,14 @@ class DiTwDDTHead(nnx.Module):
 
         for i in range(self.num_encoder_blocks, self.num_blocks):
             x = self.blocks[i](x, s, feat_rope=self.dec_rope)
+            if return_activations:
+                activations[f"decoder_block_{i - self.num_encoder_blocks}"] = jnp.sqrt(jnp.mean(jnp.square(x)))
 
         x = self.final_layer(x, s)
         x = self.unpatchify(x)  # (B, C, H, W) NCHW
         x = x.transpose(0, 2, 3, 1)  # → (B, H, W, C) NHWC
+        if return_activations:
+            return x, activations
         return x
 
     def forward_with_cfg(
