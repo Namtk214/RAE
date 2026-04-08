@@ -429,7 +429,7 @@ def _generate_samples(graphdef, ema_state, sample_fn, latent_size,
         samples = sample_fn(z, partial(ema_model.forward_with_cfg, cfg_scale=cfg_scale))
     else:
         y = labels[:n]
-        model_fn = lambda x, t, y_: ema_model(x, t, y_, training=False)
+        model_fn = lambda x, t, y: ema_model(x, t, y, training=False)
         samples = sample_fn(z, model_fn, y=y)
 
     if use_guidance:
