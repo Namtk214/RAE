@@ -31,6 +31,7 @@ from flax import nnx
 from jax.sharding import Mesh, PartitionSpec as P, NamedSharding
 from omegaconf import OmegaConf
 import optax
+from tqdm import tqdm
 
 # ── project imports ──────────────────────────────────────────────
 from stage1 import RAE
@@ -371,7 +372,12 @@ def main():
                     jax.device_get(opt_state),
                 )
 
-            for step_data in ds:
+            if is_main:
+                steps_iter = tqdm(ds, total=steps_per_epoch, desc=f"Epoch {epoch}/{num_epochs}")
+            else:
+                steps_iter = ds
+
+            for step_data in steps_iter:
                 # OPT 5: Shard image batch directly without intermediate jnp.array()
                 images = jax.device_put(
                     jnp.asarray(step_data["image"]), data_sharding
@@ -452,10 +458,14 @@ def main():
                         if k.startswith("activations/"):
                             stats[f"training/{k}"] = v
                             
-                    logger.info(
-                        f"[Epoch {epoch} | Step {global_step}] "
-                        + ", ".join(f"{k.split('/')[-1]}: {v:.4f}" for k, v in stats.items())
-                    )
+                    if is_main and hasattr(steps_iter, "set_postfix"):
+                        steps_iter.set_postfix({
+                            "loss": f"{stats['training/loss']:.4f}",
+                            "val_loss": f"{stats['training/loss_valid']:.4f}",
+                            "lr": f"{stats['training/lr']:.2e}",
+                            "iter/s": f"{steps_per_sec:.2f}"
+                        })
+                        
                     if args.wandb:
                         wandb_utils.log(stats, step=global_step)
 
