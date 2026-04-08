@@ -232,18 +232,21 @@ class LabelEmbedder(nnx.Module):
 # Sincos 2D positional embeddings (reused from model_utils.py)
 # ---------------------------------------------------------------------------
 def get_2d_sincos_pos_embed(embed_dim: int, grid_size: int) -> np.ndarray:
+    """2D sincos positional embedding. Returns (grid_size*grid_size, embed_dim)."""
     grid_h = np.arange(grid_size, dtype=np.float32)
     grid_w = np.arange(grid_size, dtype=np.float32)
     grid = np.meshgrid(grid_w, grid_h)
     grid = np.stack(grid, axis=0).reshape(2, -1)
 
-    half = embed_dim // 2
+    # Each axis gets embed_dim//2 of the total embedding
+    # We use embed_dim//4 frequencies per axis (sin+cos doubles → embed_dim//2)
+    half = embed_dim // 4
     omega = np.arange(half, dtype=np.float64) / half
     omega = 1.0 / (10000 ** omega)
 
-    out_h = np.outer(grid[1], omega)
-    out_w = np.outer(grid[0], omega)
+    out_h = np.outer(grid[1], omega)  # (N, embed_dim//4)
+    out_w = np.outer(grid[0], omega)  # (N, embed_dim//4)
 
-    emb_h = np.concatenate([np.sin(out_h), np.cos(out_h)], axis=1).astype(np.float32)
-    emb_w = np.concatenate([np.sin(out_w), np.cos(out_w)], axis=1).astype(np.float32)
-    return np.concatenate([emb_h, emb_w], axis=1)
+    emb_h = np.concatenate([np.sin(out_h), np.cos(out_h)], axis=1).astype(np.float32)  # (N, embed_dim//2)
+    emb_w = np.concatenate([np.sin(out_w), np.cos(out_w)], axis=1).astype(np.float32)  # (N, embed_dim//2)
+    return np.concatenate([emb_h, emb_w], axis=1)  # (N, embed_dim)
