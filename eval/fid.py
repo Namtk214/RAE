@@ -74,10 +74,10 @@ def _compute_inception_moments_tf(arr: np.ndarray, batch_size: int):
         tf.config.experimental_connect_to_cluster(resolver)
         tf.tpu.experimental.initialize_tpu_system(resolver)
         strategy = tf.distribute.TPUStrategy(resolver)
-        print("[FID] Using TPUStrategy for InceptionV3 feature extraction")
-    except Exception:
+        print("====== [DEBUG FID] Dùng: TENSORFLOW TPU backend ======")
+    except Exception as e:
         strategy = tf.distribute.get_strategy()  # fallback: CPU / GPU
-        print("[FID] TPU not detected — falling back to default TF device")
+        print(f"====== [DEBUG FID] Lỗi khi tạo TPU ({e}) — chạy TF trên default device (CPU/GPU) ======")
 
     # Prepare image array: ensure NHWC uint8
     x = arr
@@ -138,9 +138,14 @@ def calculate_gfid(
     mu_ref, sigma_ref = ref_arr["mu"], ref_arr["sigma"]
 
     if device == "tpu":
-        mu_gen, sigma_gen = _compute_inception_moments_tf(arr1, batch_size)
+        try:
+            mu_gen, sigma_gen = _compute_inception_moments_tf(arr1, batch_size)
+        except Exception as e:
+            print(f"====== [DEBUG FID] Backend TF bị sập ({e}); Fallback về PYTORCH CPU ======")
+            mu_gen, sigma_gen = _compute_inception_moments_from_arr(arr1, batch_size, "cpu")
     else:
         # PyTorch backend (gpu or cpu)
+        print(f"====== [DEBUG FID] Dùng: PYTORCH backend, thiết bị: {device.upper()} ======")
         mu_gen, sigma_gen = _compute_inception_moments_from_arr(arr1, batch_size, device)
 
     return _fid_from_moments(mu_gen, sigma_gen, mu_ref, sigma_ref)
