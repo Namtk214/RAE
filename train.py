@@ -479,7 +479,7 @@ def main():
                     # Helper decode function for denoise visualization
                     @jax.jit
                     def decode_fn(z):
-                        return jax.lax.stop_gradient(rae_model_gen.decode(z, training=False))
+                        return jax.lax.stop_gradient(rae_model_gen.decode(z))
 
                     _generate_samples(
                         graphdef, ema_state, eval_sample_fn,
@@ -531,7 +531,7 @@ def main():
                     
                     @jax.jit
                     def eval_decode_fn(z):
-                        return jax.lax.stop_gradient(rae_model_eval.decode(z, training=False))
+                        return jax.lax.stop_gradient(rae_model_eval.decode(z))
                         
                     from eval import evaluate_generation_distributed
                     eval_stats = evaluate_generation_distributed(
