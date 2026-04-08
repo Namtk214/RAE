@@ -61,6 +61,8 @@ def parse_args():
     p.add_argument("--wandb", action="store_true")
     p.add_argument("--global-seed", type=int, default=None)
     p.add_argument("--precision", type=str, default="bf16", choices=["fp32", "bf16"])
+    p.add_argument("--rae-checkpoint", type=str, default=None,
+                    help="Path to Stage 1 checkpoint pkl file to load RAE weights from.")
     return p.parse_args()
 
 
@@ -147,12 +149,39 @@ def main():
     # ── Seed ──
     rng = jax.random.PRNGKey(global_seed)
 
-    # ── RAE (frozen encoder+decoder) ──
+    # ── RAE (frozen encoder) ──
     rngs = nnx.Rngs(params=0, dropout=1)
     logger.info("Loading frozen RAE...")
     rae_params = dict(OmegaConf.to_container(rae_config.get("params", {}), resolve=True))
     rae = RAE(**rae_params, rngs=rngs)
-    logger.info("RAE loaded (encoder frozen, used for latent encoding).")
+
+    # Load pretrained Stage 1 weights
+    if args.rae_checkpoint:
+        import pickle
+        logger.info(f"Loading Stage 1 RAE weights from: {args.rae_checkpoint}")
+        with open(args.rae_checkpoint, "rb") as f:
+            ckpt = pickle.load(f)
+        # Stage 1 checkpoint structure: {"model": ..., "ema": ..., ...}
+        # Use EMA weights for better quality
+        raw_state = ckpt.get("ema", ckpt.get("model"))
+        if raw_state is not None:
+            raw_state = jax.tree.map(
+                lambda x: jnp.array(x) if isinstance(x, np.ndarray) else x,
+                raw_state,
+            )
+            nnx.update(rae, raw_state)
+            logger.info("RAE weights loaded successfully (EMA).")
+        else:
+            logger.warning("Checkpoint has no 'ema' or 'model' key — using random RAE weights!")
+    else:
+        logger.warning(
+            "No --rae-checkpoint provided! RAE will use RANDOM weights. "
+            "Stage 2 latents will be meaningless. Pass --rae-checkpoint <path_to_stage1_ckpt.pkl>"
+        )
+
+    # Split RAE for functional use inside JIT
+    rae_graphdef, rae_state_frozen = nnx.split(rae)
+    logger.info("RAE frozen (will be used inside train_step JIT).")
 
     # ── DiT model ──
     logger.info("Instantiating DiT model...")
@@ -196,7 +225,7 @@ def main():
         final_lr=float(sched_cfg.get("final_lr", 2e-5)),
         warmup_from_zero=bool(sched_cfg.get("warmup_from_zero", False)),
     )
-    opt_state = optimizer.init(nnx.state(model))
+    opt_state = optimizer.init(model_state)  # use split state, not nnx.state(model)
     opt_state = jax.device_put(opt_state, repl_sharding)
     logger.info(f"Optimizer: AdamW lr={opt_cfg.get('lr')}, schedule={sched_cfg.get('type')}, "
                 f"warmup={warmup_steps}, total={total_training_steps}")
@@ -243,25 +272,27 @@ def main():
     # - model params are replicated → same on all devices
     # - gradients computed on sharded data → auto-reduced when applied to replicated params
     @jax.jit
-    def train_step(model_state, opt_state, ema_state, batch_x, batch_y, step_rng):
-        """Single training step with flow matching loss.
+    def train_step(model_state, opt_state, ema_state, images, batch_y, step_rng):
+        """Single training step: RAE encode + flow matching loss.
 
-        Data parallelism is handled via mesh sharding:
-        - batch_x is sharded across devices (each gets B/N_devices)
-        - model_state is replicated
-        - grad(loss) on sharded data → mean grad auto-computed by XLA
+        RAE encode is inside JIT so XLA can fuse encode + DiT forward:
+        - images sharded (each device gets B/N_devices)
+        - model_state replicated (same on all devices)
+        - rae_state frozen (in closure, replicated)
+        - grads auto-reduced via mesh sharding
         """
-
+        # ── RAE encode inside JIT (stop_gradient, frozen) ──
+        rae_m = nnx.merge(rae_graphdef, rae_state_frozen)
+        latents = jax.lax.stop_gradient(rae_m.encode(images, training=False))
         def loss_fn(params):
-            # Reconstruct model from graphdef + params for forward pass
+            # Reconstruct DiT from graphdef + params for forward pass
             m = nnx.merge(graphdef, params)
-            rng_local = step_rng
 
             def model_forward(xt, t, y):
-                return m(xt, t, y, training=True, rng=rng_local)
+                return m(xt, t, y, training=True, rng=step_rng)
 
             terms = transport.training_losses(
-                model_forward, batch_x, step_rng, y=batch_y,
+                model_forward, latents, step_rng, y=batch_y,
             )
             return jnp.mean(terms["loss"])
 
@@ -296,13 +327,11 @@ def main():
 
     # ── Training loop ──
     global_step = 0
-    running_loss = 0.0
+    running_loss = jnp.zeros(())  # stay on device, no sync per step
     start_time = time.time()
 
     logger.info(f"Starting training for {num_epochs} epochs...")
     logger.info(f"Compute dtype: {compute_dtype}")
-
-    model_state = nnx.state(model)
 
     with mesh:
         for epoch in range(num_epochs):
@@ -322,26 +351,21 @@ def main():
                 images = batch["image"]
                 labels = batch.get("label", jnp.zeros(images.shape[0], dtype=jnp.int32))
 
-                # Encode images to latents with frozen RAE
-                # RAE.encode: (B, H, W, 3) → (B, 16, 16, 768) NHWC
-                rng, rng_enc = jax.random.split(rng)
-                latents = jax.lax.stop_gradient(
-                    rae.encode(images, rng=rng_enc, training=False)
-                )
-
                 rng, step_rng = jax.random.split(rng)
 
+                # RAE encode now happens inside train_step JIT
                 loss, model_state, opt_state, ema_state = train_step(
                     model_state, opt_state, ema_state,
-                    latents, labels, step_rng,
+                    images, labels, step_rng,
                 )
 
-                running_loss += float(loss)
+                # Accumulate loss without host sync (stays on device)
+                running_loss = running_loss + loss
                 global_step += 1
 
-                # Logging
                 if log_interval > 0 and global_step % log_interval == 0 and is_main:
-                    avg_loss = running_loss / log_interval
+                    # float() here is the only host sync point — once per log_interval
+                    avg_loss = float(running_loss) / log_interval
                     elapsed = time.time() - start_time
                     steps_per_sec = log_interval / elapsed
 
@@ -357,7 +381,7 @@ def main():
                     if args.wandb:
                         wandb_utils.log(stats, step=global_step)
 
-                    running_loss = 0.0
+                    running_loss = jnp.zeros(())  # reset on device
                     start_time = time.time()
 
                 # Visual sampling
