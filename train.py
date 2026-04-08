@@ -64,6 +64,8 @@ def parse_args():
     p.add_argument("--precision", type=str, default="bf16", choices=["fp32", "bf16"])
     p.add_argument("--eval-fid-every", type=int, default=0, help="Evaluate FID with samples every N steps")
     p.add_argument("--num-fid-samples", type=int, default=50000, help="Number of samples for FID")
+    p.add_argument("--rae-checkpoint", type=str, default=None,
+                    help="Path to Stage 1 checkpoint pkl file to load RAE weights from.")
     return p.parse_args()
 
 
@@ -147,11 +149,34 @@ def main():
     # ── Seed ──
     rng = jax.random.PRNGKey(global_seed)
 
-    # ── RAE (frozen encoder) ──
+    # ── RAE (frozen encoder + decoder for eval) ──
     rngs = nnx.Rngs(params=0, dropout=1)
-    logger.info("Loading frozen RAE...")
+    logger.info("Loading RAE...")
     rae_params = dict(OmegaConf.to_container(rae_config.get("params", {}), resolve=True))
     rae = RAE(**rae_params, rngs=rngs)
+
+    # Load pretrained Stage 1 weights
+    if args.rae_checkpoint:
+        import pickle
+        logger.info(f"Loading Stage 1 RAE weights from: {args.rae_checkpoint}")
+        try:
+            with open(args.rae_checkpoint, "rb") as f:
+                ckpt = pickle.load(f)
+            # Stage 1 checkpoint structure: {"model": ..., "ema": ..., ...}
+            raw_state = ckpt.get("ema", ckpt.get("model"))
+            if raw_state is not None:
+                raw_state = jax.tree.map(
+                    lambda x: jnp.array(x) if isinstance(x, np.ndarray) else x,
+                    raw_state,
+                )
+                nnx.update(rae, raw_state)
+                logger.info("RAE weights loaded successfully.")
+            else:
+                logger.warning("Checkpoint has no 'ema' or 'model' key — using random RAE weights!")
+        except Exception as e:
+            logger.warning(f"Failed to load RAE checkpoint: {e}")
+    else:
+        logger.warning("No --rae-checkpoint provided! RAE evaluation decode will use RANDOM weights.")
 
     # Split RAE so we can JIT encode separately
     rae_graphdef, rae_state = nnx.split(rae)
