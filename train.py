@@ -39,7 +39,7 @@ from utils.device_utils import create_mesh, get_data_sharding, get_replicated_sh
 from utils.model_utils import instantiate_from_config
 from utils.train_utils import parse_configs, update_ema, center_crop_arr
 from utils.optim_utils import build_optimizer_with_schedule
-from utils.resume_utils import save_checkpoint, load_checkpoint
+from utils.resume_utils import save_checkpoint, restore_checkpoint, configure_experiment_dirs, build_checkpoint_manager
 from utils.wandb_utils import setup_wandb, log_metrics, log_images
 from data import build_dataloader
 
@@ -127,10 +127,10 @@ def main():
     compute_dtype = jnp.bfloat16 if args.precision == "bf16" else jnp.float32
 
     # ── Experiment dir ──
-    experiment_dir = os.path.join(args.results_dir, "stage2")
-    checkpoint_dir = os.path.join(experiment_dir, "checkpoints")
-    if is_main:
-        os.makedirs(checkpoint_dir, exist_ok=True)
+    experiment_dir, checkpoint_dir = configure_experiment_dirs(
+        args.results_dir, f"stage2-{Path(args.config).stem}",
+    )
+    ckpt_mngr = build_checkpoint_manager(checkpoint_dir, max_to_keep=3)
 
     logging.basicConfig(level=logging.INFO if is_main else logging.WARNING)
     logger = logging.getLogger("train_stage2")
@@ -309,10 +309,11 @@ def main():
             # Checkpoint at epoch start
             if checkpoint_interval > 0 and epoch % checkpoint_interval == 0 and is_main and epoch > 0:
                 logger.info(f"Saving checkpoint at epoch {epoch}...")
-                nnx.update(model, model_state)
                 save_checkpoint(
-                    os.path.join(checkpoint_dir, f"ep-{epoch:07d}"),
-                    model, ema_state, opt_state, epoch, global_step,
+                    ckpt_mngr, global_step,
+                    jax.device_get(model_state),
+                    jax.device_get(ema_state),
+                    jax.device_get(opt_state),
                 )
 
             for step_data in ds:
@@ -399,10 +400,11 @@ def main():
     # Final checkpoint
     if is_main:
         logger.info("Saving final checkpoint...")
-        nnx.update(model, model_state)
         save_checkpoint(
-            os.path.join(checkpoint_dir, "ep-last"),
-            model, ema_state, opt_state, num_epochs, global_step,
+            ckpt_mngr, global_step,
+            jax.device_get(model_state),
+            jax.device_get(ema_state),
+            jax.device_get(opt_state),
         )
 
     logger.info("Training complete!")
@@ -440,7 +442,7 @@ def _generate_samples(model, ema_state, sample_fn, latent_size,
 
     # Note: RAE decode requires the decoder to be loaded
     # For now just log that samples were generated
-    logger.info(f"Generated {n} latent samples at step {global_step}")
+    print(f"Generated {n} latent samples at step {global_step}")
     # if rae decoder is available:
     # images = rae.decode(samples)
     # if use_wandb:
