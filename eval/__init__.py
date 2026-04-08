@@ -120,14 +120,17 @@ def evaluate_generation_distributed(
         start, end = process_index * chunk, num_samples
     local_num = end - start
 
-    # Swap in EMA weights
-    orig_state = jax.tree.map(jnp.copy, nnx.state(model))
-    nnx.update(model, ema_state)
+    # The model passed here is usually already configured with the correct weights (e.g. EMA)
+    # in the main training loop, so we do not need to manually swap states here.
+    # We simply use `model` as is.
 
     # Generate samples
     generations = []
     rng = jax.random.PRNGKey(global_step * num_processes + process_index)
     generated = 0
+
+    from tqdm import tqdm
+    pbar = tqdm(total=local_num, desc=f"Process {process_index} Generation") if is_main else None
 
     while generated < local_num:
         n = min(batch_size, local_num - generated)
@@ -146,7 +149,7 @@ def evaluate_generation_distributed(
                 samples = samples[-1]
             samples = samples[:n]  # Take only conditional half
         else:
-            model_fn = lambda x, t, y_: model(x, t, y_, training=False)
+            model_fn = lambda x, t, y: model(x, t, y, training=False)
             samples = sample_fn(z, model_fn, y=y)
             if isinstance(samples, (list, tuple)):
                 samples = samples[-1]
@@ -165,6 +168,12 @@ def evaluate_generation_distributed(
         imgs_uint8 = (imgs_np * 255).astype(np.uint8)
         generations.append(imgs_uint8)
         generated += n
+        
+        if pbar is not None:
+            pbar.update(n)
+
+    if pbar is not None:
+        pbar.close()
 
     if is_main:
         print(f"[Process {process_index}] Generated {generated} samples")
@@ -175,8 +184,7 @@ def evaluate_generation_distributed(
     shard_path = os.path.join(temp_dir, f"gen_{global_step:07d}_{process_index:02d}.npz")
     np.savez(shard_path, arr_0=generations)
 
-    # Restore original weights
-    nnx.update(model, orig_state)
+    # Restore original weights is skipped since we didn't swap anything (model is already cloned for eval).
 
     # Barrier: wait for all processes
     try:
