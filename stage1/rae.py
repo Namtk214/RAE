@@ -94,14 +94,30 @@ class RAE(nnx.Module):
         return ViTMAEConfig()
 
     def _load_stats(self, path: str):
-        """Load pre-computed latent mean/var from PyTorch stat.pt file."""
-        import torch
-        stats = torch.load(path, map_location="cpu")
-        if "mean" in stats:
-            # PyTorch shape: (1, C, H, W) -> JAX NHWC: (1, H, W, C)
-            self.latent_mean = np.array(stats["mean"].numpy()).transpose(0, 2, 3, 1)
-        if "var" in stats:
-            self.latent_var = np.array(stats["var"].numpy()).transpose(0, 2, 3, 1)
+        """Load pre-computed latent mean/var.
+
+        Supports two formats:
+        - .npz (output of calculate_stat.py): keys 'mean' and 'var', shape (H, W, C) JAX NHWC
+        - .pt  (PyTorch format): keys 'mean' and 'var', shape (1, C, H, W) NCHW
+        """
+        if path.endswith(".npz"):
+            stats = np.load(path)
+            if "mean" in stats:
+                m = stats["mean"]
+                # If shape is (H, W, C) add batch dim → (1, H, W, C)
+                self.latent_mean = m[None] if m.ndim == 3 else m
+            if "var" in stats:
+                v = stats["var"]
+                self.latent_var = v[None] if v.ndim == 3 else v
+        else:
+            # PyTorch .pt / .pth format
+            import torch
+            stats = torch.load(path, map_location="cpu")
+            if "mean" in stats:
+                # PyTorch shape: (1, C, H, W) → JAX NHWC: (1, H, W, C)
+                self.latent_mean = np.array(stats["mean"].numpy()).transpose(0, 2, 3, 1)
+            if "var" in stats:
+                self.latent_var = np.array(stats["var"].numpy()).transpose(0, 2, 3, 1)
 
     def encode(self, x: jnp.ndarray, *, rng: Optional[jax.random.PRNGKey] = None, training: bool = False) -> jnp.ndarray:
         """Encode images to latent space.

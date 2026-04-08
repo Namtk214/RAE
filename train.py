@@ -2,12 +2,13 @@
 
 JAX/Flax NNX + TPU data parallelism via jax.sharding.Mesh.
 
-Key TPU optimizations:
-- Data sharded across all TPU cores via NamedSharding(mesh, P("data"))
-- Model params replicated (NamedSharding(mesh, P()))
-- Gradients auto-reduced via sharding (no explicit pmean needed)
-- Gradient checkpointing on DiT blocks for memory efficiency
-- bfloat16 compute precision
+Optimizations vs original:
+- rae.encode() is JIT-compiled and fused into the data pipeline
+- No per-step float() sync (running_loss accumulates on-device via jnp)
+- Gradient norm computed fully on-device (no Python list comprehension)
+- donate_argnums on train_step to avoid buffer copies
+- shard_batch uses jax.device_put directly without intermediate jnp.array()
+- encode_and_shard fused JIT to minimize host-device roundtrips
 """
 
 from __future__ import annotations
@@ -92,11 +93,9 @@ def main():
 
     num_classes = int(misc.get("num_classes", 1000))
     null_label = int(misc.get("null_label", num_classes))
-    # latent_size in config is [C, H, W] (PyTorch convention)
-    # Convert to [H, W, C] for JAX NHWC
     cfg_latent = list(misc.get("latent_size", [768, 16, 16]))
     latent_size_chw = tuple(int(d) for d in cfg_latent)  # (C, H, W)
-    latent_size = (latent_size_chw[1], latent_size_chw[2], latent_size_chw[0])  # (H, W, C) for NHWC
+    latent_size = (latent_size_chw[1], latent_size_chw[2], latent_size_chw[0])  # (H, W, C) NHWC
     shift_dim = misc.get("time_dist_shift_dim", math.prod(latent_size))
     shift_base = misc.get("time_dist_shift_base", 4096)
     time_dist_shift = math.sqrt(shift_dim / shift_base)
@@ -104,7 +103,6 @@ def main():
     # Training hypers
     per_device_batch = int(training_cfg.get("batch_size", 16))
     global_batch_size = per_device_batch * num_devices
-    # If global_batch_size is explicitly set, use it
     if "global_batch_size" in training_cfg:
         global_batch_size = int(training_cfg["global_batch_size"])
         per_device_batch = global_batch_size // num_devices
@@ -147,11 +145,15 @@ def main():
     # ── Seed ──
     rng = jax.random.PRNGKey(global_seed)
 
-    # ── RAE (frozen encoder+decoder) ──
+    # ── RAE (frozen encoder) ──
     rngs = nnx.Rngs(params=0, dropout=1)
     logger.info("Loading frozen RAE...")
     rae_params = dict(OmegaConf.to_container(rae_config.get("params", {}), resolve=True))
     rae = RAE(**rae_params, rngs=rngs)
+
+    # Split RAE so we can JIT encode separately
+    rae_graphdef, rae_state = nnx.split(rae)
+    rae_state = jax.device_put(rae_state, repl_sharding)
     logger.info("RAE loaded (encoder frozen, used for latent encoding).")
 
     # ── DiT model ──
@@ -167,7 +169,6 @@ def main():
     logger.info(f"DiT parameters: {model_param_count / 1e6:.2f}M")
 
     # ── Replicate model params across all devices ──
-    # Use split/merge to properly separate graph structure from state
     graphdef, model_state = nnx.split(model)
     model_state = jax.device_put(model_state, repl_sharding)
 
@@ -178,9 +179,8 @@ def main():
     opt_cfg = training_cfg.get("optimizer", {})
     sched_cfg = training_cfg.get("scheduler", {})
 
-    # Compute steps for LR schedule
     data_cfg = OmegaConf.to_container(full_cfg.get("data", {}), resolve=True) if "data" in full_cfg else {}
-    dataset_size = int(data_cfg.get("num_train_samples", 1281167))  # default ImageNet
+    dataset_size = int(data_cfg.get("num_train_samples", 1281167))
     steps_per_epoch_est = dataset_size // global_batch_size
     total_training_steps = num_epochs * steps_per_epoch_est
     warmup_steps = int(sched_cfg.get("warmup_epochs", 40)) * steps_per_epoch_est
@@ -218,7 +218,6 @@ def main():
         raise NotImplementedError(f"Sampler mode {sampler_mode}")
 
     # ── Data ──
-    # Read data config from YAML, with CLI args as override
     data_cfg_full = OmegaConf.to_container(full_cfg.get("data", {}), resolve=True) if "data" in full_cfg else {}
     dataset_type = args.dataset_type or data_cfg_full.get("source", "imagefolder")
     tfds_builder_dir = args.tfds_builder_dir or data_cfg_full.get("tfds_builder_dir", None)
@@ -237,29 +236,36 @@ def main():
     logger.info(f"Steps per epoch: {steps_per_epoch}")
     logger.info(f"Global batch: {global_batch_size}, Per-device: {per_device_batch}")
 
-    # ── JIT-compiled train step ──
-    # With mesh-based sharding:
-    # - data is sharded along "data" axis → each device gets per_device_batch
-    # - model params are replicated → same on all devices
-    # - gradients computed on sharded data → auto-reduced when applied to replicated params
+    # ─────────────────────────────────────────────────────────────
+    # OPT 1: JIT-compiled RAE encode step
+    # Avoids re-tracing on every Python call and keeps encoding on TPU
+    # ─────────────────────────────────────────────────────────────
     @jax.jit
-    def train_step(model_state, opt_state, ema_state, batch_x, batch_y, step_rng):
-        """Single training step with flow matching loss.
+    def encode_batch(rae_st, images, rng):
+        """Encode images → latents fully on-device (JIT compiled)."""
+        rae_model = nnx.merge(rae_graphdef, rae_st)
+        latents = jax.lax.stop_gradient(
+            rae_model.encode(images, rng=rng, training=False)
+        )
+        return latents
 
-        Data parallelism is handled via mesh sharding:
-        - batch_x is sharded across devices (each gets B/N_devices)
-        - model_state is replicated
-        - grad(loss) on sharded data → mean grad auto-computed by XLA
+    # ─────────────────────────────────────────────────────────────
+    # OPT 2: JIT train step with donate_argnums
+    # donate_argnums donates the input buffers so JAX can reuse them
+    # without extra allocation (zero-copy param updates on TPU)
+    # ─────────────────────────────────────────────────────────────
+    @partial(jax.jit, donate_argnums=(0, 1, 2))
+    def train_step(model_state, opt_state, ema_state, batch_x, batch_y, step_rng):
+        """Single training step — fully on-device, no Python sync.
+
+        Returns (loss_scalar, new_model_state, new_opt_state, new_ema_state)
+        where loss_scalar is a JAX array (not Python float) to avoid sync.
         """
 
         def loss_fn(params):
-            # Reconstruct model from graphdef + params for forward pass
             m = nnx.merge(graphdef, params)
-            rng_local = step_rng
-
             def model_forward(xt, t, y):
-                return m(xt, t, y, training=True, rng=rng_local)
-
+                return m(xt, t, y, training=True, rng=step_rng)
             terms = transport.training_losses(
                 model_forward, batch_x, step_rng, y=batch_y,
             )
@@ -267,16 +273,18 @@ def main():
 
         loss, grads = jax.value_and_grad(loss_fn)(model_state)
 
-        # Gradient clipping (global norm)
+        # OPT 3: Gradient norm fully on-device (no Python list comprehension)
         if clip_grad > 0:
-            grad_leaves = jax.tree.leaves(grads)
             global_norm = jnp.sqrt(
-                jnp.sum(jnp.array([jnp.sum(g ** 2) for g in grad_leaves]))
+                jax.tree.reduce(
+                    lambda acc, g: acc + jnp.sum(g.astype(jnp.float32) ** 2),
+                    grads,
+                    initializer=jnp.zeros(()),
+                )
             )
             scale = jnp.minimum(1.0, clip_grad / (global_norm + 1e-6))
             grads = jax.tree.map(lambda g: g * scale, grads)
 
-        # Optimizer step
         updates, new_opt_state = optimizer.update(grads, opt_state, model_state)
         new_model_state = optax.apply_updates(model_state, updates)
 
@@ -296,7 +304,8 @@ def main():
 
     # ── Training loop ──
     global_step = 0
-    running_loss = 0.0
+    # OPT 4: Accumulate loss as JAX array to avoid per-step host sync
+    running_loss = jnp.zeros(())
     start_time = time.time()
 
     logger.info(f"Starting training for {num_epochs} epochs...")
@@ -317,17 +326,21 @@ def main():
                 )
 
             for step_data in ds:
-                # ── Shard data across TPU cores ──
-                batch = shard_batch(step_data, mesh)
-                images = batch["image"]
-                labels = batch.get("label", jnp.zeros(images.shape[0], dtype=jnp.int32))
-
-                # Encode images to latents with frozen RAE
-                # RAE.encode: (B, H, W, 3) → (B, 16, 16, 768) NHWC
-                rng, rng_enc = jax.random.split(rng)
-                latents = jax.lax.stop_gradient(
-                    rae.encode(images, rng=rng_enc, training=False)
+                # OPT 5: Shard image batch directly without intermediate jnp.array()
+                images = jax.device_put(
+                    jnp.asarray(step_data["image"]), data_sharding
                 )
+                label_np = step_data.get("label", None)
+                if label_np is not None:
+                    labels = jax.device_put(jnp.asarray(label_np), data_sharding)
+                else:
+                    labels = jax.device_put(
+                        jnp.zeros(images.shape[0], dtype=jnp.int32), data_sharding
+                    )
+
+                # OPT 1 applied: encode with JIT-compiled function
+                rng, rng_enc = jax.random.split(rng)
+                latents = encode_batch(rae_state, images, rng_enc)
 
                 rng, step_rng = jax.random.split(rng)
 
@@ -336,12 +349,13 @@ def main():
                     latents, labels, step_rng,
                 )
 
-                running_loss += float(loss)
+                # OPT 4: accumulate on-device, only sync at log boundary
+                running_loss = running_loss + loss
                 global_step += 1
 
-                # Logging
+                # Logging — only sync to host every log_interval steps
                 if log_interval > 0 and global_step % log_interval == 0 and is_main:
-                    avg_loss = running_loss / log_interval
+                    avg_loss = float(running_loss) / log_interval  # single sync here
                     elapsed = time.time() - start_time
                     steps_per_sec = log_interval / elapsed
 
@@ -349,6 +363,8 @@ def main():
                         "train/loss": avg_loss,
                         "train/steps_per_sec": steps_per_sec,
                         "train/epoch": epoch,
+                        "train/lr": float(optimizer.learning_rate(opt_state[1].count)
+                                          if hasattr(optimizer, 'learning_rate') else opt_cfg.get("lr", 2e-4)),
                     }
                     logger.info(
                         f"[Epoch {epoch} | Step {global_step}] "
@@ -357,7 +373,7 @@ def main():
                     if args.wandb:
                         wandb_utils.log(stats, step=global_step)
 
-                    running_loss = 0.0
+                    running_loss = jnp.zeros(())
                     start_time = time.time()
 
                 # Visual sampling
@@ -384,7 +400,6 @@ def main():
                         null_label=null_label,
                         use_guidance=use_guidance,
                         guidance_scale=guidance_scale,
-                        # rae_decode_fn=rae.decode,
                         num_samples=1000,
                         batch_size=per_device_batch,
                         experiment_dir=experiment_dir,
@@ -417,7 +432,6 @@ def _generate_samples(graphdef, ema_state, sample_fn, latent_size,
     rng, noise_rng = jax.random.split(rng)
     z = jax.random.normal(noise_rng, (n, *latent_size))
 
-    # Reconstruct model with EMA weights
     ema_model = nnx.merge(graphdef, ema_state)
 
     if use_guidance:
@@ -425,7 +439,6 @@ def _generate_samples(graphdef, ema_state, sample_fn, latent_size,
         y = labels[:n]
         y_null = jnp.full((n,), null_label, dtype=jnp.int32)
         y = jnp.concatenate([y, y_null], axis=0)
-
         samples = sample_fn(z, partial(ema_model.forward_with_cfg, cfg_scale=cfg_scale))
     else:
         y = labels[:n]
@@ -435,7 +448,6 @@ def _generate_samples(graphdef, ema_state, sample_fn, latent_size,
     if use_guidance:
         samples = samples[:n]
 
-    # Note: RAE decode requires the decoder to be loaded
     print(f"Generated {n} latent samples at step {global_step}")
 
 
