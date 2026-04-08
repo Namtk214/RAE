@@ -332,7 +332,8 @@ class DiTwDDTHead(nnx.Module):
             x = self.blocks[i](x, s, feat_rope=self.dec_rope)
 
         x = self.final_layer(x, s)
-        x = self.unpatchify(x)
+        x = self.unpatchify(x)  # (B, C, H, W) NCHW
+        x = x.transpose(0, 2, 3, 1)  # → (B, H, W, C) NHWC
         return x
 
     def forward_with_cfg(
