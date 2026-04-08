@@ -1,23 +1,15 @@
-# ─────────────────────────────────────────────────────────────────
-# Stage-2 Training — CelebAHQ256 + DiTDH-S + DINOv2-B
-# ─────────────────────────────────────────────────────────────────
-# CelebAHQ: ~30k face images, unconditional generation
-# Uses TFDS builder at tfds_builders/celebahq256
-
 stage_1:
   target: stage1.RAE
   params:
     encoder_cls: 'Dinov2withNorm'
-    encoder_config_path: 'facebook/dinov2-with-registers-base'
+    encoder_config_path: 'facebook/dinov2-base'
     encoder_input_size: 224
     encoder_params:
-      dinov2_path: 'facebook/dinov2-with-registers-base'
+      dinov2_path: 'facebook/dinov2-base'
       normalize: true
     decoder_config_path: 'configs/decoder/ViTXL'
-    pretrained_decoder_path: 'models/decoders/dinov2/wReg_base/ViTXL_n08/model.pt'
     noise_tau: 0.0
     reshape_to_2d: true
-    normalization_stat_path: 'models/stats/dinov2/wReg_base/celebahq256/stat.pt'
 
 stage_2:
   target: stage2.models.DDT.DiTwDDTHead
@@ -29,7 +21,7 @@ stage_2:
     depth: [12, 2]
     num_heads: [6, 16]
     mlp_ratio: 4.0
-    class_dropout_prob: 1.0    # unconditional generation
+    class_dropout_prob: 0.0
     num_classes: 1
     use_qknorm: false
     use_swiglu: true
@@ -56,7 +48,7 @@ sampler:
 
 guidance:
   method: 'cfg'
-  scale: 1.0          # no guidance for unconditional
+  scale: 1.0
   t_min: 0.0
   t_max: 1.0
 
@@ -66,27 +58,22 @@ misc:
   time_dist_shift_dim: 196608
   time_dist_shift_base: 4096
 
-# ── Data — TFDS celebahq256 ──
 data:
-  source: tfds
-  dataset_name: celebahq256
-  tfds_builder_dir: null   # set via CLI --tfds-builder-dir or override here
-
-eval:
-  eval_interval: 5000
-  eval_model: true
-  data_path: null
-  reference_npz_path: null
+  source: 'tfds'
+  dataset_name: 'celebahq256'
+  data_dir: '/home/ngothanhnam508/tensorflow_datasets'
+  tfds_builder_dir: '/home/ngothanhnam508/tensorflow_datasets/celebahq256/1.0.0'
+  image_size: 256
+  num_train_samples: 30000
 
 training:
-  epochs: 3000
-  global_batch_size: 256
-  grad_accum_steps: 1
+  epochs: 200
+  global_batch_size: 128
   ema_decay: 0.9995
   num_workers: 8
   log_interval: 50
-  checkpoint_interval: 50
-  sample_every: 1000
+  checkpoint_interval: 10
+  sample_every: 500
   clip_grad: 1.0
   global_seed: 42
   optimizer:
@@ -95,8 +82,8 @@ training:
     weight_decay: 0.0
   scheduler:
     type: linear
-    warmup_epochs: 100
-    decay_end_epoch: 2000
+    warmup_epochs: 10
+    decay_end_epoch: 200
     base_lr: 2.0e-4
     final_lr: 2.0e-5
     warmup_from_zero: false

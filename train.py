@@ -38,7 +38,7 @@ from stage2.models.lightningDiT import LightningDiT
 from utils.device_utils import create_mesh, get_data_sharding, get_replicated_sharding, shard_batch, print_device_info
 from utils.model_utils import instantiate_from_config
 from utils.train_utils import parse_configs, update_ema, center_crop_arr
-from utils.optim_utils import build_optimizer
+from utils.optim_utils import build_optimizer_with_schedule
 from utils.resume_utils import save_checkpoint, load_checkpoint
 from utils.wandb_utils import setup_wandb, log_metrics, log_images
 from data import build_dataloader
@@ -92,7 +92,11 @@ def main():
 
     num_classes = int(misc.get("num_classes", 1000))
     null_label = int(misc.get("null_label", num_classes))
-    latent_size = tuple(int(d) for d in misc.get("latent_size", (768, 16, 16)))
+    # latent_size in config is [C, H, W] (PyTorch convention)
+    # Convert to [H, W, C] for JAX NHWC
+    cfg_latent = list(misc.get("latent_size", [768, 16, 16]))
+    latent_size_chw = tuple(int(d) for d in cfg_latent)  # (C, H, W)
+    latent_size = (latent_size_chw[1], latent_size_chw[2], latent_size_chw[0])  # (H, W, C) for NHWC
     shift_dim = misc.get("time_dist_shift_dim", math.prod(latent_size))
     shift_base = misc.get("time_dist_shift_base", 4096)
     time_dist_shift = math.sqrt(shift_dim / shift_base)
@@ -145,8 +149,9 @@ def main():
     # ── RAE (frozen encoder+decoder) ──
     rngs = nnx.Rngs(params=0, dropout=1)
     logger.info("Loading frozen RAE...")
-    # TODO: Wire RAE model
-    # rae = instantiate_from_config(rae_config, rngs=rngs)
+    rae_params = dict(OmegaConf.to_container(rae_config.get("params", {}), resolve=True))
+    rae = RAE(**rae_params, rngs=rngs)
+    logger.info("RAE loaded (encoder frozen, used for latent encoding).")
 
     # ── DiT model ──
     logger.info("Instantiating DiT model...")
@@ -170,10 +175,31 @@ def main():
     ema_state = jax.device_put(ema_state, repl_sharding)
 
     # ── Optimizer ──
-    optimizer, opt_msg = build_optimizer(training_cfg)
+    opt_cfg = training_cfg.get("optimizer", {})
+    sched_cfg = training_cfg.get("scheduler", {})
+
+    # Compute steps for LR schedule
+    data_cfg = OmegaConf.to_container(full_cfg.get("data", {}), resolve=True) if "data" in full_cfg else {}
+    dataset_size = int(data_cfg.get("num_train_samples", 1281167))  # default ImageNet
+    steps_per_epoch_est = dataset_size // global_batch_size
+    total_training_steps = num_epochs * steps_per_epoch_est
+    warmup_steps = int(sched_cfg.get("warmup_epochs", 40)) * steps_per_epoch_est
+
+    optimizer = build_optimizer_with_schedule(
+        lr=float(opt_cfg.get("lr", 2e-4)),
+        betas=tuple(opt_cfg.get("betas", [0.9, 0.95])),
+        weight_decay=float(opt_cfg.get("weight_decay", 0.0)),
+        clip_grad=clip_grad,
+        schedule_type=str(sched_cfg.get("type", "linear")),
+        warmup_steps=warmup_steps,
+        total_steps=total_training_steps,
+        final_lr=float(sched_cfg.get("final_lr", 2e-5)),
+        warmup_from_zero=bool(sched_cfg.get("warmup_from_zero", False)),
+    )
     opt_state = optimizer.init(nnx.state(model))
     opt_state = jax.device_put(opt_state, repl_sharding)
-    logger.info(opt_msg)
+    logger.info(f"Optimizer: AdamW lr={opt_cfg.get('lr')}, schedule={sched_cfg.get('type')}, "
+                f"warmup={warmup_steps}, total={total_training_steps}")
 
     # ── Transport ──
     transport_params = dict(transport_cfg.get("params", {}))
@@ -193,10 +219,10 @@ def main():
 
     # ── Data ──
     # Read data config from YAML, with CLI args as override
-    data_cfg = OmegaConf.to_container(full_cfg.get("data", {}), resolve=True) if "data" in full_cfg else {}
-    dataset_type = args.dataset_type or data_cfg.get("source", "imagefolder")
-    tfds_builder_dir = args.tfds_builder_dir or data_cfg.get("tfds_builder_dir", None)
-    tfds_name = data_cfg.get("dataset_name", None)
+    data_cfg_full = OmegaConf.to_container(full_cfg.get("data", {}), resolve=True) if "data" in full_cfg else {}
+    dataset_type = args.dataset_type or data_cfg_full.get("source", "imagefolder")
+    tfds_builder_dir = args.tfds_builder_dir or data_cfg_full.get("tfds_builder_dir", None)
+    tfds_name = data_cfg_full.get("dataset_name", None)
 
     ds, steps_per_epoch = build_dataloader(
         data_path=args.data_path,
@@ -296,8 +322,11 @@ def main():
                 labels = batch.get("label", jnp.zeros(images.shape[0], dtype=jnp.int32))
 
                 # Encode images to latents with frozen RAE
-                # latents = jax.lax.stop_gradient(rae.encode(images))
-                latents = images  # placeholder — replace with rae.encode(images)
+                # RAE.encode: (B, H, W, 3) → (B, 16, 16, 768) NHWC
+                rng, rng_enc = jax.random.split(rng)
+                latents = jax.lax.stop_gradient(
+                    rae.encode(images, rng=rng_enc, training=False)
+                )
 
                 rng, step_rng = jax.random.split(rng)
 
@@ -409,7 +438,10 @@ def _generate_samples(model, ema_state, sample_fn, latent_size,
     # Restore original weights
     nnx.update(model, orig_state)
 
-    # TODO: decode with RAE and log images
+    # Note: RAE decode requires the decoder to be loaded
+    # For now just log that samples were generated
+    logger.info(f"Generated {n} latent samples at step {global_step}")
+    # if rae decoder is available:
     # images = rae.decode(samples)
     # if use_wandb:
     #     log_images(images, global_step)
