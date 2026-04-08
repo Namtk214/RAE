@@ -202,8 +202,12 @@ def build_dataset(
     elif source == "imagefolder":
         if data_dir is None:
             raise ValueError("data_dir is required for ImageFolder source")
+            
+        import os
+        split_dir = os.path.join(data_dir, split)
+        
         return build_imagefolder_dataset(
-            data_dir=data_dir,
+            data_dir=split_dir,
             image_size=image_size,
             batch_size=batch_size,
             seed=seed,
@@ -245,8 +249,11 @@ def build_dataloader(
         (iterator, steps_per_epoch) tuple.
     """
     if dataset_type == "imagefolder":
+        import os
+        split_dir = os.path.join(data_path, split)
+        
         # Count images to compute steps_per_epoch
-        data_dir = Path(data_path)
+        data_dir = Path(split_dir)
         extensions = {'.jpg', '.jpeg', '.png', '.JPEG', '.JPG', '.PNG'}
         num_images = sum(
             1 for cls_dir in data_dir.iterdir() if cls_dir.is_dir()
@@ -255,7 +262,7 @@ def build_dataloader(
         steps_per_epoch = num_images // batch_size
 
         it = build_imagefolder_dataset(
-            data_dir=data_path,
+            data_dir=split_dir,
             image_size=image_size,
             batch_size=batch_size,
             seed=seed,

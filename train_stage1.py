@@ -272,6 +272,18 @@ def train(config):
         tfds_builder_dir=data_cfg.get("tfds_builder_dir"),
         image_size=data_cfg.image_size,
         batch_size=global_batch_size,
+        split="train",
+        seed=train_cfg.seed,
+    )
+    valid_split = "validation" if data_cfg.source == "tfds" else "val"
+    val_iter = build_dataset(
+        source=data_cfg.source,
+        dataset_name=data_cfg.get("dataset_name", "celebahq256"),
+        data_dir=data_cfg.get("data_dir"),
+        tfds_builder_dir=data_cfg.get("tfds_builder_dir"),
+        image_size=data_cfg.image_size,
+        batch_size=global_batch_size,
+        split=valid_split,
         seed=train_cfg.seed,
     )
 
@@ -347,6 +359,16 @@ def train(config):
     log_interval = train_cfg.log_interval
     sample_every = train_cfg.sample_every
     ckpt_interval = train_cfg.checkpoint_interval  # in epochs
+    
+    @jax.jit
+    def valid_step(decoder_params, images, val_rng):
+        nnx.update(rae_model.decoder, decoder_params)
+        z = rae_model.encode(images, rng=val_rng, training=False)
+        x_rec = rae_model.decode(z)
+        target = images.transpose(0, 3, 1, 2)
+        rec_loss = jnp.mean(jnp.abs(x_rec - target))
+        lpips_val = lpips_model(x_rec, target)
+        return rec_loss, lpips_val
 
     # Bounded ring buffer for metrics (avoid unbounded growth)
     metrics_history = defaultdict(lambda: deque(maxlen=log_interval * 2))
@@ -401,11 +423,28 @@ def train(config):
                 if (step + 1) % log_interval == 0 and jax.process_index() == 0:
                     elapsed = time.time() - start_time
                     steps_per_sec = log_interval / elapsed
+                    
+                    try:
+                        val_batch = next(val_iter)
+                    except TypeError:
+                        if not hasattr(val_iter, "__next__"):
+                            val_iter = iter(val_iter)
+                        try:
+                            val_batch = next(val_iter)
+                        except StopIteration:
+                            val_iter = iter(val_iter)
+                            val_batch = next(val_iter)
+                    
+                    val_images = shard_batch(val_batch, mesh)["image"]
+                    rng, val_rng = jax.random.split(rng)
+                    val_rec_loss, val_lpips = valid_step(ema_params, val_images, val_rng)
 
                     summary = {
                         f"train/{k}": sum(list(metrics_history[k])[-log_interval:]) / log_interval
                         for k in metrics_history
                     }
+                    summary["val/rec_loss"] = float(val_rec_loss)
+                    summary["val/lpips_loss"] = float(val_lpips)
                     summary["train/steps_per_sec"] = steps_per_sec
                     summary["train/epoch"] = epoch
                     summary["train/step"] = step + 1
