@@ -44,9 +44,10 @@ def compute_generation_metrics(
     ref_arr,
     gen_arr: np.ndarray,
     batch_size: int = 128,
+    device: str = "tpu",
 ) -> Dict[str, float]:
     """Compute generation metrics (FID)."""
-    fid = calculate_gfid(gen_arr, ref_arr, batch_size)
+    fid = calculate_gfid(gen_arr, ref_arr, batch_size, device=device)
     return {"fid": fid}
 
 
@@ -69,6 +70,7 @@ def evaluate_generation_distributed(
     reference_npz_path: Optional[str] = None,
     rae_decode_fn=None,
     mesh=None,
+    device: str = "tpu",
 ) -> Optional[Dict[str, float]]:
     """Distributed generation evaluation — each process generates its shard, host 0 computes metrics.
 
@@ -111,6 +113,7 @@ def evaluate_generation_distributed(
     if is_main:
         os.makedirs(temp_dir, exist_ok=True)
         print(f"\n[Eval] Starting distributed generation at step {global_step}")
+        print(f"🚀 [Chẩn đoán FID] Lát nữa FID sẽ được tính bằng backend: {device.upper()}")
 
     # Barrier: wait for directory creation
     # On multi-host TPU, use jax.experimental.multihost_utils
@@ -226,7 +229,7 @@ def evaluate_generation_distributed(
 
         if reference_npz_path and os.path.exists(reference_npz_path):
             ref_stats = np.load(reference_npz_path)
-            metrics = compute_generation_metrics(ref_stats, combined, 128)
+            metrics = compute_generation_metrics(ref_stats, combined, 128, device=device)
             print(f"[Eval] Step {global_step} — FID: {metrics.get('fid', -1):.4f}")
         else:
             print(f"[Eval] No reference NPZ found at {reference_npz_path}")
