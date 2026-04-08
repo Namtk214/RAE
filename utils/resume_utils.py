@@ -108,10 +108,12 @@ def save_checkpoint(
     # Convert to numpy via jax.device_get
     model_np = jax.device_get(model_params)
     ema_np = jax.device_get(ema_params)
+    opt_np = jax.device_get(opt_state)
     
     ckpt = {
         "model": model_np,
         "ema": ema_np,
+        "opt_state": opt_np,
     }
     if extra:
         ckpt.update(extra)
