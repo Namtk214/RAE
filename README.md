@@ -7,22 +7,39 @@ No YAML config file required — all parameters are passed directly as CLI flags
 
 ---
 
-## Environment
+## Setup
 
-### Install dependencies
+### 1. Clone repositories
 
 ```bash
+# Create working folder
+mkdir rae_jax && cd rae_jax
+
+# Main codebase
+git clone https://github.com/Namtk214/RAE.git
+
+# TFDS custom builders (required for CelebAHQ256 and other custom datasets)
+git clone https://github.com/Namtk214/tfds_builders.git
+```
+
+> `tfds_builders/` và `RAE/` sẽ nằm cùng cấp bên trong `rae_jax/`.  
+> Truyền đường dẫn của nó qua `--tfds-builder-dir` khi dùng dataset TFDS custom.
+
+### 2. Install dependencies
+
+```bash
+cd RAE
 pip install -r requirements.txt
 ```
 
-### Verify TPU
+### 3. Verify TPU
 
 ```python
 import jax
 print(jax.devices())  # Should show 8 TPU cores
 ```
 
-### WandB
+### 4. WandB (optional)
 
 ```bash
 export WANDB_KEY="your_wandb_api_key"
