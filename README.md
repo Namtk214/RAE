@@ -32,11 +32,6 @@ cd RAE
 pip install -r requirements.txt
 ```
 
-### 3. Verify TPU
-
-```python
-import jax
-print(jax.devices())  # Should show 8 TPU cores
 ```
 
 ### 4. WandB (optional)
@@ -82,18 +77,97 @@ rae_jax/
 #   data/imagenet/val/<class_id>/*.JPEG
 ```
 
-### CelebA-HQ 256
+### CelebA-HQ 256 via TFDS Builder
+
+The `tfds_builders` repo contains custom [TensorFlow Datasets](https://www.tensorflow.org/datasets) builders that auto-download and prepare datasets. CelebAHQ256 pulls from HuggingFace `mattymchen/celeba-hq`.
+
+**Step 1 — Clone the builders repo** (nếu chưa clone ở bước Setup):
 
 ```bash
-# Option A — TFDS (auto-download via tfds_builders):
-#   --data-source tfds --dataset-name celebahq256
-
-# Option B — ImageFolder:
-#   data/celebahq256/train/<class>/*.png
-#   --data-source imagefolder
+git clone https://github.com/Namtk214/tfds_builders.git
 ```
 
----
+**Step 2 — Install dependencies cho builder:**
+
+```bash
+pip install tensorflow tensorflow-datasets datasets pillow
+
+# Kiểm tra:
+python -c "import tensorflow; import tensorflow_datasets; print('OK')"
+```
+
+**Step 3 — Build the dataset:**
+
+```bash
+cd tfds_builders/celebahq256
+
+# Option A: tfds CLI
+tfds build
+
+# Option B: nếu tfds CLI không có trong PATH, dùng Python trực tiếp
+python -c "
+import celebahq256_dataset_builder
+builder = celebahq256_dataset_builder.Builder(data_dir='$HOME/tensorflow_datasets')
+builder.download_and_prepare()
+print('Done!')
+"
+
+# Chỉ định thư mục data cụ thể:
+tfds build --data_dir /path/to/tensorflow_datasets
+```
+
+> Quá trình build sẽ tải ~30k images từ HuggingFace, resize về 256×256, và lưu dưới dạng TFRecord tại `~/tensorflow_datasets/celebahq256/1.0.0/`. Mất khoảng 5-10 phút tùy mạng.
+
+**Step 4 — Truyền vào training script:**
+
+```bash
+# Stage 1
+python train_stage1.py \
+  --data-dir ~/tensorflow_datasets \
+  --data-source tfds \
+  --dataset-name celebahq256 \
+  --num-train-samples 30000 \
+  ...
+
+# Stage 2 (with config)
+python train.py \
+  --config configs/stage2/training/CelebAHQ256/DiTDH-S_DINOv2-B.yaml \
+  --data-path ~/tensorflow_datasets \
+  --dataset-type tfds \
+  ...
+
+# Stage 2 (without config)
+python train.py \
+  --data-path ~/tensorflow_datasets \
+  --dataset-type tfds \
+  --tfds-name celebahq256 \
+  --tfds-builder-dir ~/tensorflow_datasets/celebahq256/1.0.0 \
+  --num-train-samples 30000 \
+  ...
+```
+
+> **Lưu ý:** `--tfds-builder-dir` chỉ cần khi **không dùng `--config`**. Nếu dùng YAML config, đường dẫn builder đã được khai báo trong `data.tfds_builder_dir`.
+
+**Các dataset có sẵn trong `tfds_builders/`:**
+
+| Builder | Mô tả | Splits |
+|---------|--------|--------|
+| `celebahq256` | CelebA-HQ 256×256 | train (30k), validation |
+| `celebahq` | CelebA-HQ full resolution | train, validation |
+| `celebahq64` | CelebA-HQ 64×64 | train, validation |
+| `cifar10` | CIFAR-10 | train, test |
+| `imagenet2012` | ImageNet-1K (cần tải thủ công) | train, validation |
+
+### CelebA-HQ 256 via ImageFolder (thay thế)
+
+Nếu không muốn dùng TFDS, có thể dùng ImageFolder:
+
+```bash
+# Cấu trúc:
+#   data/celebahq256/train/0/*.png
+#   data/celebahq256/val/0/*.png
+# Dùng flag: --dataset-type imagefolder
+```
 
 ## Stage 1: Representation Autoencoder
 
@@ -104,17 +178,29 @@ Stage 1 trains a ViT-XL decoder to reconstruct images from frozen DINOv2 encoder
 Run once before training to compute encoder mean/variance used to normalize latents:
 
 ```bash
+# TFDS (CelebAHQ256 đã build)
+python calculate_stat.py \
+  --config configs/stage1/pretrained/DINOv2-B.yaml \
+  --data-path ~/tensorflow_datasets \
+  --output-dir models/stats/dinov2 \
+  --image-size 256 \
+  --batch-size 32 \
+  --num-samples 30000 \
+  --dataset-type tfds \
+  --tfds-name celebahq256
+
+# ImageFolder
 python calculate_stat.py \
   --config configs/stage1/pretrained/DINOv2-B.yaml \
   --data-path data/celebahq256/train \
-  --output-dir models/stats/dinov2_celebahq256 \
+  --output-dir models/stats/dinov2 \
   --image-size 256 \
   --batch-size 32 \
   --num-samples 30000 \
   --dataset-type imagefolder
 ```
 
-Output: `models/stats/dinov2_celebahq256/normalization_stats.npz` (keys: `mean`, `var`)
+Output: `models/stats/dinov2/normalization_stats.npz` (keys: `mean`, `var`)
 
 
 ---

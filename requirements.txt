@@ -24,7 +24,7 @@ tensorflow-datasets>=4.9.0
 # ──────────────────────────────────────────────
 # Pretrained Encoders (HuggingFace)
 # ──────────────────────────────────────────────
-transformers>=4.36.0
+transformers>=4.40.0
 
 # ──────────────────────────────────────────────
 # Eval (lazy-loaded, only at eval time)
