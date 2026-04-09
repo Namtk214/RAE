@@ -87,6 +87,8 @@ def parse_args():
     p.add_argument("--lr", type=float, default=None)
     p.add_argument("--num-train-samples", type=int, default=None,
                    help="Dataset size — used to compute steps/epoch")
+    p.add_argument("--num-classes", type=int, default=None,
+                   help="Number of classes (1 for unconditional, 1000 for ImageNet)")
 
     return p.parse_args()
 
@@ -104,19 +106,21 @@ _DEFAULTS = dict(
         decoder_config_path="configs/decoder/ViTXL",
         noise_tau=0.0,
         reshape_to_2d=True,
+        normalization_stat_path="models/stats/dinov2/normalization_stats.npz",
     ),
-    # DiT model
+    # DiT model (DiT-S for CelebAHQ256)
     model_target="stage2.models.DDT.DiTwDDTHead",
     model_params=dict(
         input_size=16, patch_size=1, in_channels=768,
-        hidden_size=[1152, 2048], depth=[28, 2], num_heads=[16, 16],
-        mlp_ratio=4.0, class_dropout_prob=0.1, num_classes=1000,
+        hidden_size=[384, 2048], depth=[12, 2], num_heads=[6, 16],
+        mlp_ratio=4.0, class_dropout_prob=0.0, num_classes=1,
         use_qknorm=False, use_swiglu=True, use_rope=True,
         use_rmsnorm=True, wo_shift=False, use_pos_embed=True,
     ),
     # Misc
-    num_classes=1000, null_label=1000,
+    num_classes=1, null_label=1,
     latent_size=[768, 16, 16],
+    time_dist_shift_dim=196608,
     time_dist_shift_base=4096,
     # Transport
     transport_params=dict(path_type="Linear", prediction="velocity",
@@ -125,19 +129,19 @@ _DEFAULTS = dict(
     sampler_mode="ODE",
     sampler_params=dict(sampling_method="euler", num_steps=50,
                         atol=1e-6, rtol=1e-3, reverse=False),
-    # Training
-    batch_size=16, global_batch_size=1024,
-    ema_decay=0.9995, epochs=1400, log_interval=100,
-    sample_every=10000, checkpoint_interval=10, clip_grad=1.0,
+    # Training (CelebAHQ256 defaults)
+    batch_size=16, global_batch_size=128,
+    ema_decay=0.9995, epochs=200, log_interval=50,
+    sample_every=5000, checkpoint_interval=5000, clip_grad=1.0,
     global_seed=42,
     # Optimizer
     lr=2e-4, betas=[0.9, 0.95], weight_decay=0.0,
-    schedule_type="linear", warmup_epochs=40, final_lr=2e-5,
+    schedule_type="linear", warmup_epochs=10, final_lr=2e-5,
     warmup_from_zero=False,
     # Guidance
     guidance_scale=1.0,
-    # Data
-    num_train_samples=1281167, dataset_source="imagefolder",
+    # Data (CelebAHQ256)
+    num_train_samples=30000, dataset_source="tfds",
 )
 
 
@@ -239,10 +243,13 @@ def main():
         model_params = dict(D["model_params"])
         model_target = D["model_target"]
 
-        num_classes = D["num_classes"]
-        null_label = D["null_label"]
+        num_classes = args.num_classes if args.num_classes is not None else D["num_classes"]
+        null_label = num_classes
+        # Override model_params num_classes if CLI flag provided
+        if args.num_classes is not None:
+            model_params["num_classes"] = num_classes
         cfg_latent = list(D["latent_size"])
-        shift_dim = None
+        shift_dim = D.get("time_dist_shift_dim", None)
         shift_base = D["time_dist_shift_base"]
 
         global_batch_size = args.global_batch_size or D["global_batch_size"]

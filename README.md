@@ -3,7 +3,7 @@
 ### [Paper](https://arxiv.org/abs/2510.11690) | [Project Page](https://rae-dit.github.io/) | [PyTorch](https://github.com/bytetriper/RAE)
 
 JAX/Flax NNX port of [RAE](https://github.com/bytetriper/RAE), optimised for **TPU v5e-8** data-parallel training.  
-No YAML config file required — all parameters are passed directly as CLI flags.
+YAML config file is optional — all parameters can be passed directly as CLI flags.
 
 ---
 
@@ -221,66 +221,102 @@ python extract_decoder.py \
 
 Stage 2 trains a flow-matching DiT on RAE latent space.
 
-### Step 1 — Train DiT (XL, ~675M params)
+`train.py` supports **two modes**:
+- **With `--config`:** loads all model/training params from YAML (original behavior)
+- **Without `--config`:** uses hardcoded defaults + CLI flags (no YAML needed)
 
-**CelebAHQ-256:**
+### CLI Flags Reference
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--config` | None | YAML config file (optional) |
+| `--data-path` | *required* | Dataset root or TFDS data_dir |
+| `--results-dir` | `ckpts` | Root directory for checkpoints |
+| `--experiment-name` | auto | Sub-folder name inside results-dir |
+| `--image-size` | 256 | Input image resolution |
+| `--dataset-type` | `tfds` | `imagefolder` or `tfds` |
+| `--tfds-name` | None | TFDS dataset name (e.g. `celebahq256`) |
+| `--tfds-builder-dir` | None | Path to custom TFDS builder directory |
+| `--rae-checkpoint` | None | Stage 1 checkpoint `.pkl` for decoder weights |
+| `--normalization-stat-path` | None | Latent normalization `.npz` |
+| `--pretrained-decoder-path` | None | Pretrained decoder weights |
+| `--reference-npz-path` | None | Pre-computed FID reference `.npz` |
+| `--epochs` | 200 | Number of training epochs |
+| `--global-batch-size` | 128 | Total batch across all TPU devices |
+| `--lr` | 2e-4 | Learning rate |
+| `--num-train-samples` | 30000 | Dataset size (for steps/epoch calculation) |
+| `--num-classes` | 1 | Number of classes (1=unconditional, 1000=ImageNet) |
+| `--precision` | `bf16` | `fp32` or `bf16` |
+| `--global-seed` | 42 | Random seed |
+| `--eval-fid-every` | 0 | Evaluate FID every N steps (0=disabled) |
+| `--num-fid-samples` | 50000 | Number of samples for FID |
+| `--wandb` | off | Enable WandB logging |
+| `--wandb-project` | `rae-jax-stage2` | WandB project name |
+| `--wandb-entity` | `""` | WandB entity |
+
+### Step 1 — Train DiT
+
+**CelebAHQ-256 (DiT-S, ~130M params) — with config:**
+
+```bash
+python train.py \
+  --config configs/stage2/training/CelebAHQ256/DiTDH-S_DINOv2-B.yaml \
+  --data-path ~/tensorflow_datasets \
+  --dataset-type tfds \
+  --rae-checkpoint ckpts/stage1/celebahq256_dinov2b_decXL/checkpoints/ckpt_last.pkl \
+  --results-dir ckpts/stage2 \
+  --wandb
+```
+
+**CelebAHQ-256 — without config (CLI flags only):**
 
 ```bash
 python train.py \
   --data-path ~/tensorflow_datasets \
   --dataset-type tfds \
   --tfds-name celebahq256 \
+  --tfds-builder-dir ~/tensorflow_datasets/celebahq256/1.0.0 \
   --num-train-samples 30000 \
+  --num-classes 1 \
   --rae-checkpoint ckpts/stage1/celebahq256_dinov2b_decXL/checkpoints/ckpt_last.pkl \
-  --normalization-stat-path models/stats/dinov2_celebahq256/normalization_stats.npz \
+  --normalization-stat-path models/stats/dinov2/normalization_stats.npz \
   --results-dir ckpts/stage2 \
-  --experiment-name celebahq256_xl \
-  --epochs 1400 \
-  --global-batch-size 1024 \
+  --experiment-name celebahq256_s \
+  --epochs 200 \
+  --global-batch-size 128 \
   --lr 2e-4 \
-  --eval-fid-every 25000 \
-  --num-fid-samples 10000 \
-  --wandb \
-  --wandb-project rae-jax-stage2
-```
-
-**ImageNet-256:**
-
-```bash
-python train.py \
-  --data-path /data/imagenet \
-  --dataset-type imagefolder \
-  --num-train-samples 1281167 \
-  --rae-checkpoint ckpts/stage1/imagenet_dinov2b_decXL/checkpoints/ckpt_last.pkl \
-  --normalization-stat-path models/stats/dinov2_imagenet/normalization_stats.npz \
-  --reference-npz-path data/imagenet/VIRTUAL_imagenet256_labeled.npz \
-  --results-dir ckpts/stage2 \
-  --experiment-name imagenet256_xl \
-  --epochs 1400 \
-  --global-batch-size 1024 \
-  --lr 2e-4 \
-  --eval-fid-every 25000 \
-  --num-fid-samples 10000 \
   --wandb
 ```
 
-**Hardcoded defaults** (edit at the top of `train.py` to change):
+**ImageNet-256 (DiT-XL, ~675M params) — with config:**
 
-| Constant | Value | Description |
-|----------|-------|-------------|
-| `_EMA_DECAY` | 0.9995 | EMA decay rate |
-| `_SCHEDULE_TYPE` | linear | LR schedule |
-| `_WARMUP_EPOCHS` | 40 | Warmup epochs |
-| `_FINAL_LR` | 2e-5 | Final LR |
-| `_CLIP_GRAD` | 1.0 | Gradient clip norm |
-| `_HIDDEN_SIZE` | [1152, 2048] | DiT hidden dims (XL) |
-| `_DEPTH` | [28, 2] | DiT depth (XL) |
-| `_IN_CHANNELS` | 768 | Latent channels (DINOv2-B) |
-| `_PATH_TYPE` | Linear | Flow matching path |
-| `_TIME_DIST_TYPE` | logit-normal_0_1 | Time distribution |
-| `_NUM_STEPS` | 50 | ODE steps at eval |
+```bash
+python train.py \
+  --config configs/stage2/training/ImageNet256/DiTDHXL-DINOv2-B.yaml \
+  --data-path /data/imagenet \
+  --dataset-type imagefolder \
+  --rae-checkpoint ckpts/stage1/imagenet_dinov2b_decXL/checkpoints/ckpt_last.pkl \
+  --reference-npz-path data/imagenet/VIRTUAL_imagenet256_labeled.npz \
+  --results-dir ckpts/stage2 \
+  --eval-fid-every 25000 \
+  --wandb
+```
 
-> To switch to the **Small model** (DiTDH-S, ~130M), change `_HIDDEN_SIZE = [384, 2048]` and `_DEPTH = [12, 2]` in `train.py`.
+Training auto-resumes from the latest checkpoint if `results-dir/experiment-name/checkpoints/` already exists.
+
+**Hardcoded defaults** (used when `--config` is not provided, edit `_DEFAULTS` dict in `train.py`):
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| DiT model | DiT-S `[384,2048]` | hidden_size, depth=[12,2] |
+| num_classes | 1 | Unconditional (CelebAHQ) |
+| ema_decay | 0.9995 | EMA decay rate |
+| schedule | linear | LR schedule type |
+| warmup | 10 epochs | Warmup period |
+| clip_grad | 1.0 | Gradient clip norm |
+| log_interval | 50 | Log every N steps |
+| sample_every | 5000 | Generate samples every N steps |
+| checkpoint_interval | 5000 | Save checkpoint every N steps |
 
 ---
 
