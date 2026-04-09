@@ -114,7 +114,8 @@ python calculate_stat.py \
   --dataset-type imagefolder
 ```
 
-Output: `models/stats/dinov2_celebahq256/stats.npz` (keys: `mean`, `var`)
+Output: `models/stats/dinov2_celebahq256/normalization_stats.npz` (keys: `mean`, `var`)
+
 
 ---
 
@@ -122,7 +123,7 @@ Output: `models/stats/dinov2_celebahq256/stats.npz` (keys: `mean`, `var`)
 
 ```bash
 python train_stage1.py \
-  --data-dir /data/celebahq256 \
+  --data-dir ~/tensorflow_datasets \
   --data-source tfds \
   --dataset-name celebahq256 \
   --num-train-samples 30000 \
@@ -226,12 +227,12 @@ Stage 2 trains a flow-matching DiT on RAE latent space.
 
 ```bash
 python train.py \
-  --data-path /data/celebahq256 \
+  --data-path ~/tensorflow_datasets \
   --dataset-type tfds \
   --tfds-name celebahq256 \
   --num-train-samples 30000 \
   --rae-checkpoint ckpts/stage1/celebahq256_dinov2b_decXL/checkpoints/ckpt_last.pkl \
-  --normalization-stat-path models/stats/dinov2_celebahq256/stats.npz \
+  --normalization-stat-path models/stats/dinov2_celebahq256/normalization_stats.npz \
   --results-dir ckpts/stage2 \
   --experiment-name celebahq256_xl \
   --epochs 1400 \
@@ -251,7 +252,7 @@ python train.py \
   --dataset-type imagefolder \
   --num-train-samples 1281167 \
   --rae-checkpoint ckpts/stage1/imagenet_dinov2b_decXL/checkpoints/ckpt_last.pkl \
-  --normalization-stat-path models/stats/dinov2_imagenet/stats.npz \
+  --normalization-stat-path models/stats/dinov2_imagenet/normalization_stats.npz \
   --reference-npz-path data/imagenet/VIRTUAL_imagenet256_labeled.npz \
   --results-dir ckpts/stage2 \
   --experiment-name imagenet256_xl \

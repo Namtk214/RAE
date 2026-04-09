@@ -289,11 +289,14 @@ def main():
     logger.info(f"DiT parameters: {model_param_count / 1e6:.2f}M")
 
     # ── Replicate model params across all devices ──
-    graphdef, model_state = nnx.split(model)
-    model_state = jax.device_put(model_state, repl_sharding)
+    # Split into (graphdef, params, other_state) so that value_and_grad only
+    # differentiates params while non-param state (RNG, batch stats) is preserved.
+    graphdef, params, other_state = nnx.split(model, nnx.Param, ...)
+    params = jax.device_put(params, repl_sharding)
+    other_state = jax.device_put(other_state, repl_sharding)
 
-    # ── EMA (replicated) ──
-    ema_state = jax.tree.map(jnp.copy, model_state)
+    # ── EMA (replicated) — tracks only Param leaves ──
+    ema_state = jax.tree.map(jnp.copy, params)
 
     # ── Optimizer ──
     dataset_size        = args.num_train_samples
@@ -312,7 +315,7 @@ def main():
         final_lr=_FINAL_LR,
         warmup_from_zero=False,
     )
-    opt_state = optimizer.init(nnx.state(model))
+    opt_state = optimizer.init(params)
     opt_state = jax.device_put(opt_state, repl_sharding)
     logger.info(f"Optimizer: AdamW lr={args.lr}, schedule={_SCHEDULE_TYPE}, "
                 f"warmup={warmup_steps}, total={total_training_steps}")
@@ -322,7 +325,7 @@ def main():
     global_step_resume = 0
     if restored_ckpt is not None:
         logger.info(f"Resuming DiT from Stage 2 checkpoint at step {restored_step}...")
-        model_state = jax.device_put(
+        params = jax.device_put(
             jax.tree.map(lambda x: jnp.array(x) if isinstance(x, np.ndarray) else x, restored_ckpt["model"]),
             repl_sharding,
         )
@@ -406,11 +409,11 @@ def main():
     # without extra allocation (zero-copy param updates on TPU)
     # ─────────────────────────────────────────────────────────────
     @partial(jax.jit, donate_argnums=(0, 1, 2))
-    def train_step(model_state, opt_state, ema_state, batch_x, batch_y, step_rng):
+    def train_step(params, opt_state, ema_state, batch_x, batch_y, step_rng):
         """Single training step — fully on-device, no Python sync."""
 
-        def loss_fn(params):
-            m = nnx.merge(graphdef, params)
+        def loss_fn(p):
+            m = nnx.merge(graphdef, p, other_state)
             def model_forward(xt, t, y):
                 return m(xt, t, y, training=True, rng=step_rng, return_activations=True)
             
@@ -420,7 +423,7 @@ def main():
             v_mag = jnp.sqrt(jnp.mean(jnp.square(terms["pred"])))
             return jnp.mean(terms["loss"]), (v_mag, acts)
 
-        (loss, (v_mag, acts)), grads = jax.value_and_grad(loss_fn, has_aux=True)(model_state)
+        (loss, (v_mag, acts)), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
 
         # OPT 3: Gradient norm fully on-device (no Python list comprehension)
         if clip_grad > 0:
@@ -434,16 +437,16 @@ def main():
             scale = jnp.minimum(1.0, clip_grad / (global_norm + 1e-6))
             grads = jax.tree.map(lambda g: g * scale, grads)
 
-        updates, new_opt_state = optimizer.update(grads, opt_state, model_state)
-        new_model_state = optax.apply_updates(model_state, updates)
+        updates, new_opt_state = optimizer.update(grads, opt_state, params)
+        new_params = optax.apply_updates(params, updates)
 
         # EMA update
         new_ema = jax.tree.map(
-            lambda e, m: e * ema_decay + m * (1.0 - ema_decay),
-            ema_state, new_model_state,
+            lambda e, p: e * ema_decay + p * (1.0 - ema_decay),
+            ema_state, new_params,
         )
 
-        return loss, new_model_state, new_opt_state, new_ema, v_mag, acts
+        return loss, new_params, new_opt_state, new_ema, v_mag, acts
 
     # ── Eval ──
     do_eval            = args.eval_fid_every > 0
@@ -458,21 +461,21 @@ def main():
     running_stats = {}
     
     @jax.jit
-    def valid_step(model_state, batch_x, batch_y, step_rng):
+    def valid_step(p, batch_x, batch_y, step_rng):
         def loss_fn(params):
-            m = nnx.merge(graphdef, params)
+            m = nnx.merge(graphdef, params, other_state)
             def model_forward(xt, t, y):
                 return m(xt, t, y, training=False, rng=step_rng)
             terms = transport.training_losses(model_forward, batch_x, step_rng, y=batch_y)
             return jnp.mean(terms["loss"])
-        return loss_fn(model_state)
+        return loss_fn(p)
 
     start_time = time.time()
 
     logger.info(f"Starting training for {num_epochs} epochs...")
     logger.info(f"Compute dtype: {compute_dtype}")
 
-    model_state = nnx.state(model)
+
 
     with mesh:
         for epoch in range(start_epoch, num_epochs):
@@ -504,8 +507,8 @@ def main():
 
                 rng, step_rng = jax.random.split(rng)
 
-                loss, model_state, opt_state, ema_state, v_mag, acts = train_step(
-                    model_state, opt_state, ema_state,
+                loss, params, opt_state, ema_state, v_mag, acts = train_step(
+                    params, opt_state, ema_state,
                     latents, labels, step_rng,
                 )
 
@@ -528,7 +531,7 @@ def main():
                     logger.info(f"Saving checkpoint at step {global_step}...")
                     save_checkpoint(
                         ckpt_mngr, global_step,
-                        jax.device_get(model_state),
+                        jax.device_get(params),
                         jax.device_get(ema_state),
                         jax.device_get(opt_state),
                     )
@@ -561,7 +564,7 @@ def main():
                         
                     rng, val_rng = jax.random.split(rng)
                     valid_latents = encode_batch(rae_state, valid_images, val_rng)
-                    loss_valid = float(valid_step(model_state, valid_latents, valid_labels, val_rng))
+                    loss_valid = float(valid_step(params, valid_latents, valid_labels, val_rng))
 
                     stats = {
                         "training/loss": avg_stats["loss"],
@@ -678,7 +681,7 @@ def main():
         logger.info("Saving final checkpoint...")
         save_checkpoint(
             ckpt_mngr, global_step,
-            jax.device_get(model_state),
+            jax.device_get(params),
             jax.device_get(ema_state),
             jax.device_get(opt_state),
         )
