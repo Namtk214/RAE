@@ -47,109 +47,98 @@ from data import build_dataloader
 
 
 # ─────────────────────────────────────────────────────────────────
-# ── Hardcoded constants (change here, not via CLI) ───────────────────────
-# RAE encoder / decoder
-_RAE_ENCODER_CLS         = "Dinov2withNorm"
-_RAE_ENCODER_CONFIG_PATH = "facebook/dinov2-base"
-_RAE_ENCODER_INPUT_SIZE  = 224
-_RAE_DINOV2_PATH         = "facebook/dinov2-base"
-_RAE_DECODER_CONFIG_PATH = "configs/decoder/ViTXL"
-_RAE_NOISE_TAU           = 0.0   # 0 at Stage 2 inference
-
-# DiT model (XL by default)
-_MODEL_TARGET       = "stage2.models.DDT.DiTwDDTHead"
-_INPUT_SIZE         = 16           # latent spatial size
-_PATCH_SIZE         = 1
-_IN_CHANNELS        = 768
-_HIDDEN_SIZE        = [1152, 2048]
-_DEPTH              = [28, 2]
-_NUM_HEADS          = [16, 16]
-_MLP_RATIO          = 4.0
-_CLASS_DROPOUT_PROB = 0.1
-_NUM_CLASSES        = 1000
-_LATENT_SIZE_CHW    = [768, 16, 16]  # [C, H, W]
-
-# Transport / flow matching
-_PATH_TYPE       = "Linear"
-_PREDICTION      = "velocity"
-_TIME_DIST_TYPE  = "logit-normal_0_1"
-_SHIFT_BASE      = 4096
-
-# Sampler (ODE / eval only)
-_SAMPLER_MODE    = "ODE"
-_SAMPLING_METHOD = "euler"
-_NUM_STEPS       = 50
-
-# Optimizer / schedule
-_BETAS          = (0.9, 0.95)
-_WEIGHT_DECAY   = 0.0
-_EMA_DECAY      = 0.9995
-_SCHEDULE_TYPE  = "linear"
-_WARMUP_EPOCHS  = 40
-_FINAL_LR       = 2e-5
-_CLIP_GRAD      = 1.0
-
-# Logging / checkpointing
-_LOG_INTERVAL        = 100
-_SAMPLE_EVERY        = 10000
-_CKPT_INTERVAL       = 10   # in global steps
-
-
 # CLI
 # ─────────────────────────────────────────────────────────────────
 def parse_args():
-    p = argparse.ArgumentParser(
-        description="Train Stage 2 DiT on RAE latents (JAX)",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-
-    # ── Paths ────────────────────────────────────────────────────────
-    p.add_argument("--data-path", type=str, required=True,
-                   help="Dataset root (ImageFolder) or TFDS data_dir")
-    p.add_argument("--results-dir", type=str, default="ckpts/stage2",
-                   help="Root directory for checkpoints")
-    p.add_argument("--experiment-name", type=str, default="stage2_run",
-                   help="Sub-folder name inside results-dir")
-    p.add_argument("--rae-checkpoint", type=str, default=None,
-                   help="Stage 1 checkpoint .pkl to load decoder weights from")
-    p.add_argument("--normalization-stat-path", type=str, default=None,
-                   help="Latent normalization stats .pt/.npz")
-    p.add_argument("--pretrained-decoder-path", type=str, default=None,
-                   help="Pretrained decoder .pt weights")
-    p.add_argument("--reference-npz-path", type=str, default=None,
-                   help="Pre-computed FID reference .npz")
-
-    # ── Data ────────────────────────────────────────────────────────
+    p = argparse.ArgumentParser(description="Train Stage 2 transport model on RAE latents (JAX)")
+    p.add_argument("--config", type=str, default=None,
+                   help="YAML config file (optional — if omitted, uses hardcoded defaults + CLI flags)")
+    p.add_argument("--data-path", type=str, required=True)
+    p.add_argument("--results-dir", type=str, default="ckpts")
+    p.add_argument("--experiment-name", type=str, default=None,
+                   help="Experiment name (default: auto from config or 'stage2_run')")
     p.add_argument("--image-size", type=int, default=256)
-    p.add_argument("--dataset-type", type=str, default="imagefolder",
-                   choices=["imagefolder", "tfds"])
-    p.add_argument("--tfds-name", type=str, default=None,
-                   help="TFDS dataset name (e.g. celebahq256, imagenet2012)")
+    p.add_argument("--dataset-type", type=str, default=None,
+                    choices=["imagefolder", "tfds"],
+                    help="Data source type. Overrides config 'data.source'.")
     p.add_argument("--tfds-builder-dir", type=str, default=None,
-                   help="Path to custom TFDS builder directory")
-    p.add_argument("--num-train-samples", type=int, default=1281167,
-                   help="Dataset size — used to compute steps/epoch")
-
-    # ── Training knobs ───────────────────────────────────────────────
-    p.add_argument("--epochs", type=int, default=1400)
-    p.add_argument("--global-batch-size", type=int, default=1024,
-                   help="Total batch across all TPU devices")
-    p.add_argument("--lr", type=float, default=2e-4)
-    p.add_argument("--global-seed", type=int, default=42)
-    p.add_argument("--precision", type=str, default="bf16",
-                   choices=["fp32", "bf16"])
-
-    # ── Eval ────────────────────────────────────────────────────────
-    p.add_argument("--eval-fid-every", type=int, default=0,
-                   help="Evaluate FID every N steps (0 = disabled)")
-    p.add_argument("--num-fid-samples", type=int, default=50000)
-
-    # ── WandB ───────────────────────────────────────────────────────
+                    help="Path to custom TFDS builder dir (e.g. tfds_builders/celebahq256).")
+    p.add_argument("--tfds-name", type=str, default=None,
+                   help="TFDS dataset name (e.g. celebahq256)")
     p.add_argument("--wandb", action="store_true")
     p.add_argument("--wandb-project", type=str, default="rae-jax-stage2")
     p.add_argument("--wandb-entity", type=str, default="")
+    p.add_argument("--global-seed", type=int, default=None)
+    p.add_argument("--precision", type=str, default="bf16", choices=["fp32", "bf16"])
+    p.add_argument("--eval-fid-every", type=int, default=0, help="Evaluate FID with samples every N steps")
+    p.add_argument("--num-fid-samples", type=int, default=50000, help="Number of samples for FID")
+    p.add_argument("--rae-checkpoint", type=str, default=None,
+                    help="Path to Stage 1 checkpoint pkl file to load RAE weights from.")
+    p.add_argument("--reference-npz-path", type=str, default=None,
+                   help="Pre-computed FID reference .npz")
+    p.add_argument("--normalization-stat-path", type=str, default=None,
+                   help="Latent normalization stats .npz")
+    p.add_argument("--pretrained-decoder-path", type=str, default=None,
+                   help="Pretrained decoder .pt weights")
+
+    # ── Training knobs (used when --config is not provided) ──────
+    p.add_argument("--epochs", type=int, default=None)
+    p.add_argument("--global-batch-size", type=int, default=None)
+    p.add_argument("--lr", type=float, default=None)
+    p.add_argument("--num-train-samples", type=int, default=None,
+                   help="Dataset size — used to compute steps/epoch")
 
     return p.parse_args()
+
+
+# ─────────────────────────────────────────────────────────────────
+# Hardcoded defaults (used when --config is not provided)
+# ─────────────────────────────────────────────────────────────────
+_DEFAULTS = dict(
+    # RAE
+    rae_params=dict(
+        encoder_cls="Dinov2withNorm",
+        encoder_config_path="facebook/dinov2-base",
+        encoder_input_size=224,
+        encoder_params={"dinov2_path": "facebook/dinov2-base", "normalize": True},
+        decoder_config_path="configs/decoder/ViTXL",
+        noise_tau=0.0,
+        reshape_to_2d=True,
+    ),
+    # DiT model
+    model_target="stage2.models.DDT.DiTwDDTHead",
+    model_params=dict(
+        input_size=16, patch_size=1, in_channels=768,
+        hidden_size=[1152, 2048], depth=[28, 2], num_heads=[16, 16],
+        mlp_ratio=4.0, class_dropout_prob=0.1, num_classes=1000,
+        use_qknorm=False, use_swiglu=True, use_rope=True,
+        use_rmsnorm=True, wo_shift=False, use_pos_embed=True,
+    ),
+    # Misc
+    num_classes=1000, null_label=1000,
+    latent_size=[768, 16, 16],
+    time_dist_shift_base=4096,
+    # Transport
+    transport_params=dict(path_type="Linear", prediction="velocity",
+                          time_dist_type="logit-normal_0_1"),
+    # Sampler
+    sampler_mode="ODE",
+    sampler_params=dict(sampling_method="euler", num_steps=50,
+                        atol=1e-6, rtol=1e-3, reverse=False),
+    # Training
+    batch_size=16, global_batch_size=1024,
+    ema_decay=0.9995, epochs=1400, log_interval=100,
+    sample_every=10000, checkpoint_interval=10, clip_grad=1.0,
+    global_seed=42,
+    # Optimizer
+    lr=2e-4, betas=[0.9, 0.95], weight_decay=0.0,
+    schedule_type="linear", warmup_epochs=40, final_lr=2e-5,
+    warmup_from_zero=False,
+    # Guidance
+    guidance_scale=1.0,
+    # Data
+    num_train_samples=1281167, dataset_source="imagefolder",
+)
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -167,35 +156,153 @@ def main():
     process_index = jax.process_index()
     is_main = process_index == 0
 
-    # ── Derive constants from hardcoded defaults + CLI args ──────────
-    num_classes     = _NUM_CLASSES
-    null_label      = _NUM_CLASSES          # null class = num_classes
-    latent_size_chw = tuple(_LATENT_SIZE_CHW)  # (C, H, W)
-    latent_size     = (latent_size_chw[1], latent_size_chw[2], latent_size_chw[0])  # (H, W, C) NHWC
-    shift_dim       = math.prod(latent_size)
-    time_dist_shift = math.sqrt(shift_dim / _SHIFT_BASE)
+    # ── Config: load from YAML or use hardcoded defaults ──
+    if args.config is not None:
+        full_cfg = OmegaConf.load(args.config)
+        (rae_config, model_config, transport_config, sampler_config,
+         guidance_config, misc_config, training_config, eval_config) = parse_configs(full_cfg)
 
-    global_batch_size = args.global_batch_size
-    per_device_batch  = global_batch_size // num_devices
+        misc = OmegaConf.to_container(misc_config or {}, resolve=True)
+        transport_cfg = OmegaConf.to_container(transport_config or {}, resolve=True)
+        sampler_cfg = OmegaConf.to_container(sampler_config or {}, resolve=True)
+        guidance_cfg = OmegaConf.to_container(guidance_config or {}, resolve=True)
+        training_cfg = OmegaConf.to_container(training_config or {}, resolve=True)
+        data_cfg = OmegaConf.to_container(full_cfg.get("data", {}), resolve=True) if "data" in full_cfg else {}
+        eval_cfg_raw = OmegaConf.to_container(eval_config or {}, resolve=True) if eval_config else {}
+
+        rae_params = dict(OmegaConf.to_container(rae_config.get("params", {}), resolve=True))
+        model_params = dict(OmegaConf.to_container(model_config.get("params", {}), resolve=True))
+        model_target = model_config.get("target", "stage2.DiTwDDTHead")
+
+        num_classes = int(misc.get("num_classes", 1000))
+        null_label = int(misc.get("null_label", num_classes))
+        cfg_latent = list(misc.get("latent_size", [768, 16, 16]))
+        shift_dim = misc.get("time_dist_shift_dim", None)
+        shift_base = misc.get("time_dist_shift_base", 4096)
+
+        opt_cfg = training_cfg.get("optimizer", {})
+        sched_cfg = training_cfg.get("scheduler", {})
+
+        per_device_batch = int(training_cfg.get("batch_size", 16))
+        global_batch_size = per_device_batch * num_devices
+        if "global_batch_size" in training_cfg:
+            global_batch_size = int(training_cfg["global_batch_size"])
+            per_device_batch = global_batch_size // num_devices
+
+        ema_decay = float(training_cfg.get("ema_decay", 0.9995))
+        num_epochs = int(training_cfg.get("epochs", 1400))
+        log_interval = int(training_cfg.get("log_interval", 100))
+        sample_every = int(training_cfg.get("sample_every", 2500))
+        checkpoint_interval = int(training_cfg.get("checkpoint_interval", 10))
+        clip_grad = float(training_cfg.get("clip_grad", 1.0))
+        global_seed = args.global_seed if args.global_seed is not None else int(training_cfg.get("global_seed", 0))
+
+        guidance_scale = float(guidance_cfg.get("scale", 1.0))
+
+        dataset_size = int(data_cfg.get("num_train_samples", 1281167))
+        warmup_epochs = int(sched_cfg.get("warmup_epochs", 40))
+
+        lr = float(opt_cfg.get("lr", 2e-4))
+        betas = tuple(opt_cfg.get("betas", [0.9, 0.95]))
+        weight_decay = float(opt_cfg.get("weight_decay", 0.0))
+        schedule_type = str(sched_cfg.get("type", "linear"))
+        final_lr = float(sched_cfg.get("final_lr", 2e-5))
+        warmup_from_zero = bool(sched_cfg.get("warmup_from_zero", False))
+
+        transport_params_raw = dict(transport_cfg.get("params", {}))
+        transport_params_raw.pop("time_dist_shift", None)
+
+        sampler_mode = sampler_cfg.get("mode", "ODE").upper()
+        sampler_params_raw = dict(sampler_cfg.get("params", {}))
+
+        dataset_type = args.dataset_type or data_cfg.get("source", "imagefolder")
+        tfds_builder_dir = args.tfds_builder_dir or data_cfg.get("tfds_builder_dir", None)
+        tfds_name = args.tfds_name or data_cfg.get("dataset_name", None)
+
+        do_eval_cfg = bool(eval_cfg_raw)
+        eval_interval = int(eval_cfg_raw.get("eval_interval", 0))
+        reference_npz_path = args.reference_npz_path or eval_cfg_raw.get("reference_npz_path", None)
+
+        exp_name = args.experiment_name or f"stage2-{Path(args.config).stem}"
+        wandb_config = OmegaConf.to_container(full_cfg, resolve=True)
+
+    else:
+        # ── No config file: use hardcoded defaults ──
+        D = _DEFAULTS
+
+        rae_params = dict(D["rae_params"])
+        if args.pretrained_decoder_path:
+            rae_params["pretrained_decoder_path"] = args.pretrained_decoder_path
+        if args.normalization_stat_path:
+            rae_params["normalization_stat_path"] = args.normalization_stat_path
+
+        model_params = dict(D["model_params"])
+        model_target = D["model_target"]
+
+        num_classes = D["num_classes"]
+        null_label = D["null_label"]
+        cfg_latent = list(D["latent_size"])
+        shift_dim = None
+        shift_base = D["time_dist_shift_base"]
+
+        global_batch_size = args.global_batch_size or D["global_batch_size"]
+        per_device_batch = global_batch_size // num_devices
+
+        ema_decay = D["ema_decay"]
+        num_epochs = args.epochs or D["epochs"]
+        log_interval = D["log_interval"]
+        sample_every = D["sample_every"]
+        checkpoint_interval = D["checkpoint_interval"]
+        clip_grad = D["clip_grad"]
+        global_seed = args.global_seed if args.global_seed is not None else D["global_seed"]
+
+        guidance_scale = D["guidance_scale"]
+
+        dataset_size = args.num_train_samples or D["num_train_samples"]
+        warmup_epochs = D["warmup_epochs"]
+
+        lr = args.lr or D["lr"]
+        betas = tuple(D["betas"])
+        weight_decay = D["weight_decay"]
+        schedule_type = D["schedule_type"]
+        final_lr = D["final_lr"]
+        warmup_from_zero = D["warmup_from_zero"]
+
+        transport_params_raw = dict(D["transport_params"])
+        sampler_mode = D["sampler_mode"]
+        sampler_params_raw = dict(D["sampler_params"])
+
+        dataset_type = args.dataset_type or D["dataset_source"]
+        tfds_builder_dir = args.tfds_builder_dir
+        tfds_name = args.tfds_name
+
+        do_eval_cfg = False
+        eval_interval = 0
+        reference_npz_path = args.reference_npz_path
+
+        exp_name = args.experiment_name or "stage2_run"
+        wandb_config = vars(args)
+
+    # ── Derived values (common to both modes) ──
+    latent_size_chw = tuple(int(d) for d in cfg_latent)  # (C, H, W)
+    latent_size = (latent_size_chw[1], latent_size_chw[2], latent_size_chw[0])  # (H, W, C) NHWC
+    if shift_dim is None:
+        shift_dim = math.prod(latent_size)
+    time_dist_shift = math.sqrt(shift_dim / shift_base)
+
     assert global_batch_size % num_devices == 0, \
         f"global_batch_size {global_batch_size} must be divisible by {num_devices} devices"
 
-    ema_decay          = _EMA_DECAY
-    num_epochs         = args.epochs
-    log_interval       = _LOG_INTERVAL
-    sample_every       = _SAMPLE_EVERY
-    checkpoint_interval = _CKPT_INTERVAL
-    clip_grad          = _CLIP_GRAD
-    global_seed        = args.global_seed
-
-    guidance_scale  = 1.0       # CFG disabled by default during training
-    use_guidance    = False
-
+    use_guidance = guidance_scale > 1.0
     compute_dtype = jnp.bfloat16 if args.precision == "bf16" else jnp.float32
+
+    steps_per_epoch_est = dataset_size // global_batch_size
+    total_training_steps = num_epochs * steps_per_epoch_est
+    warmup_steps = warmup_epochs * steps_per_epoch_est
 
     # ── Experiment dir ──
     experiment_dir, checkpoint_dir = configure_experiment_dirs(
-        args.results_dir, args.experiment_name,
+        args.results_dir, exp_name,
     )
     ckpt_mngr = build_checkpoint_manager(checkpoint_dir, max_to_keep=3)
 
@@ -205,9 +312,9 @@ def main():
     # ── WandB ──
     if args.wandb and is_main:
         wandb_utils.initialize(
-            config=vars(args),
+            config=wandb_config,
             entity=args.wandb_entity or os.environ.get("ENTITY", ""),
-            exp_name=args.experiment_name,
+            exp_name=exp_name,
             project_name=args.wandb_project,
         )
 
@@ -217,19 +324,6 @@ def main():
     # ── RAE (frozen encoder + decoder for eval) ──
     rngs = nnx.Rngs(params=0, dropout=1)
     logger.info("Loading RAE...")
-    rae_params = dict(
-        encoder_cls=_RAE_ENCODER_CLS,
-        encoder_config_path=_RAE_ENCODER_CONFIG_PATH,
-        encoder_input_size=_RAE_ENCODER_INPUT_SIZE,
-        encoder_params={"dinov2_path": _RAE_DINOV2_PATH, "normalize": True},
-        decoder_config_path=_RAE_DECODER_CONFIG_PATH,
-        noise_tau=_RAE_NOISE_TAU,
-        reshape_to_2d=True,
-    )
-    if args.pretrained_decoder_path:
-        rae_params["pretrained_decoder_path"] = args.pretrained_decoder_path
-    if args.normalization_stat_path:
-        rae_params["normalization_stat_path"] = args.normalization_stat_path
     rae = RAE(**rae_params, rngs=rngs)
 
     # Load pretrained Stage 1 weights
@@ -239,7 +333,6 @@ def main():
         try:
             with open(args.rae_checkpoint, "rb") as f:
                 ckpt = pickle.load(f)
-            # Stage 1 checkpoint structure: {"model": ..., "ema": ..., ...}
             raw_state = ckpt.get("ema", ckpt.get("model"))
             if raw_state is not None:
                 raw_state = jax.tree.map(
@@ -262,24 +355,6 @@ def main():
 
     # ── DiT model ──
     logger.info("Instantiating DiT model...")
-    model_params = dict(
-        input_size=_INPUT_SIZE,
-        patch_size=_PATCH_SIZE,
-        in_channels=_IN_CHANNELS,
-        hidden_size=_HIDDEN_SIZE,
-        depth=_DEPTH,
-        num_heads=_NUM_HEADS,
-        mlp_ratio=_MLP_RATIO,
-        class_dropout_prob=_CLASS_DROPOUT_PROB,
-        num_classes=_NUM_CLASSES,
-        use_qknorm=False,
-        use_swiglu=True,
-        use_rope=True,
-        use_rmsnorm=True,
-        wo_shift=False,
-        use_pos_embed=True,
-    )
-    model_target = _MODEL_TARGET
     if "DDT" in model_target:
         model = DiTwDDTHead(**model_params, rngs=rngs, dtype=compute_dtype)
     else:
@@ -288,7 +363,7 @@ def main():
     model_param_count = sum(p.size for p in jax.tree.leaves(nnx.state(model)))
     logger.info(f"DiT parameters: {model_param_count / 1e6:.2f}M")
 
-    # ── Split model into graphdef + full state (all variable types) ──
+    # ── Replicate model params across all devices ──
     graphdef, model_state = nnx.split(model)
     model_state = jax.device_put(model_state, repl_sharding)
 
@@ -296,25 +371,15 @@ def main():
     ema_state = jax.tree.map(jnp.copy, model_state)
 
     # ── Optimizer ──
-    dataset_size        = args.num_train_samples
-    steps_per_epoch_est = dataset_size // global_batch_size
-    total_training_steps = num_epochs * steps_per_epoch_est
-    warmup_steps        = _WARMUP_EPOCHS * steps_per_epoch_est
-
     optimizer = build_optimizer_with_schedule(
-        lr=args.lr,
-        betas=_BETAS,
-        weight_decay=_WEIGHT_DECAY,
-        clip_grad=_CLIP_GRAD,
-        schedule_type=_SCHEDULE_TYPE,
-        warmup_steps=warmup_steps,
-        total_steps=total_training_steps,
-        final_lr=_FINAL_LR,
-        warmup_from_zero=False,
+        lr=lr, betas=betas, weight_decay=weight_decay, clip_grad=clip_grad,
+        schedule_type=schedule_type, warmup_steps=warmup_steps,
+        total_steps=total_training_steps, final_lr=final_lr,
+        warmup_from_zero=warmup_from_zero,
     )
-    opt_state = optimizer.init(model_state)
+    opt_state = optimizer.init(nnx.state(model))
     opt_state = jax.device_put(opt_state, repl_sharding)
-    logger.info(f"Optimizer: AdamW lr={args.lr}, schedule={_SCHEDULE_TYPE}, "
+    logger.info(f"Optimizer: AdamW lr={lr}, schedule={schedule_type}, "
                 f"warmup={warmup_steps}, total={total_training_steps}")
 
     # ── Resume from Stage 2 checkpoint if available ──
@@ -345,26 +410,18 @@ def main():
         logger.info("No Stage 2 checkpoint found — starting from scratch with random DiT weights.")
 
     # ── Transport ──
-    transport = create_transport(
-        path_type=_PATH_TYPE,
-        prediction=_PREDICTION,
-        loss_weight=None,
-        time_dist_type=_TIME_DIST_TYPE,
-        time_dist_shift=time_dist_shift,
-    )
+    transport = create_transport(**transport_params_raw, time_dist_shift=time_dist_shift)
+
     transport_sampler = Sampler(transport)
-    sampler_params = dict(sampling_method=_SAMPLING_METHOD, num_steps=_NUM_STEPS,
-                          atol=1e-6, rtol=1e-3, reverse=False)
-    if _SAMPLER_MODE == "ODE":
-        eval_sample_fn = transport_sampler.sample_ode(**sampler_params)
+
+    if sampler_mode == "ODE":
+        eval_sample_fn = transport_sampler.sample_ode(**sampler_params_raw)
+    elif sampler_mode == "SDE":
+        eval_sample_fn = transport_sampler.sample_sde(**sampler_params_raw)
     else:
-        eval_sample_fn = transport_sampler.sample_sde(**sampler_params)
+        raise NotImplementedError(f"Sampler mode {sampler_mode}")
 
     # ── Data ──
-    dataset_type     = args.dataset_type
-    tfds_builder_dir = args.tfds_builder_dir
-    tfds_name        = args.tfds_name
-
     ds, steps_per_epoch = build_dataloader(
         data_path=args.data_path,
         image_size=args.image_size,
@@ -387,7 +444,10 @@ def main():
     logger.info(f"Steps per epoch: {steps_per_epoch}")
     logger.info(f"Global batch: {global_batch_size}, Per-device: {per_device_batch}")
 
-    # ── JIT-compiled RAE encode step ──
+    # ─────────────────────────────────────────────────────────────
+    # OPT 1: JIT-compiled RAE encode step
+    # Avoids re-tracing on every Python call and keeps encoding on TPU
+    # ─────────────────────────────────────────────────────────────
     @jax.jit
     def encode_batch(rae_st, images, rng):
         """Encode images → latents fully on-device (JIT compiled)."""
@@ -397,16 +457,20 @@ def main():
         )
         return latents
 
-    # ── JIT train step ──
+    # ─────────────────────────────────────────────────────────────
+    # OPT 2: JIT train step with donate_argnums
+    # donate_argnums donates the input buffers so JAX can reuse them
+    # without extra allocation (zero-copy param updates on TPU)
+    # ─────────────────────────────────────────────────────────────
     @partial(jax.jit, donate_argnums=(0, 1, 2))
     def train_step(model_state, opt_state, ema_state, batch_x, batch_y, step_rng):
         """Single training step — fully on-device, no Python sync."""
 
-        def loss_fn(state):
-            m = nnx.merge(graphdef, state)
+        def loss_fn(params):
+            m = nnx.merge(graphdef, params)
             def model_forward(xt, t, y):
                 return m(xt, t, y, training=True, rng=step_rng, return_activations=True)
-
+            
             terms, acts = transport.training_losses(
                 model_forward, batch_x, step_rng, has_aux=True, y=batch_y,
             )
@@ -415,6 +479,7 @@ def main():
 
         (loss, (v_mag, acts)), grads = jax.value_and_grad(loss_fn, has_aux=True)(model_state)
 
+        # OPT 3: Gradient norm fully on-device (no Python list comprehension)
         if clip_grad > 0:
             global_norm = jnp.sqrt(
                 jax.tree.reduce(
@@ -429,6 +494,7 @@ def main():
         updates, new_opt_state = optimizer.update(grads, opt_state, model_state)
         new_model_state = optax.apply_updates(model_state, updates)
 
+        # EMA update
         new_ema = jax.tree.map(
             lambda e, m: e * ema_decay + m * (1.0 - ema_decay),
             ema_state, new_model_state,
@@ -437,33 +503,31 @@ def main():
         return loss, new_model_state, new_opt_state, new_ema, v_mag, acts
 
     # ── Eval ──
-    do_eval            = args.eval_fid_every > 0
-    eval_interval      = 0
-    reference_npz_path = args.reference_npz_path
-    eval_fid_every     = args.eval_fid_every
+    do_eval = do_eval_cfg or args.eval_fid_every > 0
+    eval_fid_every = args.eval_fid_every
 
     # ── Training loop ──
     global_step = global_step_resume
     start_epoch = global_step // steps_per_epoch if steps_per_epoch > 0 else 0
+    # OPT 4: Accumulate loss as JAX array to avoid per-step host sync
     running_stats = {}
-
+    
     @jax.jit
     def valid_step(model_state, batch_x, batch_y, step_rng):
-        def loss_fn(state):
-            m = nnx.merge(graphdef, state)
+        def loss_fn(params):
+            m = nnx.merge(graphdef, params)
             def model_forward(xt, t, y):
                 return m(xt, t, y, training=False, rng=step_rng)
             terms = transport.training_losses(model_forward, batch_x, step_rng, y=batch_y)
             return jnp.mean(terms["loss"])
         return loss_fn(model_state)
 
-
     start_time = time.time()
 
     logger.info(f"Starting training for {num_epochs} epochs...")
     logger.info(f"Compute dtype: {compute_dtype}")
 
-
+    model_state = nnx.state(model)
 
     with mesh:
         for epoch in range(start_epoch, num_epochs):
@@ -534,7 +598,6 @@ def main():
                     try:
                         valid_data = next(ds_valid)
                     except TypeError:
-                        # Sometimes iterators need iter()
                         if not hasattr(ds_valid, "__next__"):
                             ds_valid = iter(ds_valid)
                         try:
@@ -561,7 +624,7 @@ def main():
                         "training/steps_per_sec": steps_per_sec,
                         "training/epoch": epoch,
                         "training/lr": float(optimizer.learning_rate(opt_state[1].count)
-                                          if hasattr(optimizer, 'learning_rate') else args.lr),
+                                          if hasattr(optimizer, 'learning_rate') else lr),
                     }
                     for k, v in avg_stats.items():
                         if k.startswith("activations/"):
@@ -608,7 +671,7 @@ def main():
                         reference_npz_path = os.path.join(experiment_dir, f"fid_ref_stat_{num_samples}.npz")
                         
                     if is_main and not os.path.exists(reference_npz_path):
-                        logger.info(f"Reference NPZ {reference_npz_path} not found. Generating it now via subprocess (to avoid consuming TPU memory)...")
+                        logger.info(f"Reference NPZ {reference_npz_path} not found. Generating it now via subprocess...")
                         import subprocess
                         import sys
                         cmd = [
@@ -653,7 +716,7 @@ def main():
                         use_guidance=use_guidance,
                         guidance_scale=guidance_scale,
                         num_samples=num_samples,
-                        batch_size=min(per_device_batch * 4, 512),  # 4x bigger for eval throughput
+                        batch_size=min(per_device_batch * 4, 512),
                         experiment_dir=experiment_dir,
                         global_step=global_step,
                         reference_npz_path=reference_npz_path,
@@ -701,7 +764,6 @@ def _generate_samples(graphdef, ema_state, sample_fn, latent_size,
         intermediates = [step[:n] for step in intermediates]
     else:
         y = labels[:n]
-        # Use y=None, **kw to match transport.py drift convention (passes y as keyword)
         model_fn = lambda x, t, y=None, **kw: ema_model(x, t, y, training=False)
         samples, intermediates = sample_fn(
             z, model_fn, y=y,
@@ -713,7 +775,6 @@ def _generate_samples(graphdef, ema_state, sample_fn, latent_size,
         print(f"Decoding {num_inter} intermediate denoising steps for WandB...")
 
         for idx, inter_z in enumerate(intermediates):
-            # intermediates[0] = after step log_every, [1] = 2*log_every, ...
             ode_step = (idx + 1) * log_every
             images = np.array(rae_decode_fn(inter_z))
             images = np.clip(images, 0.0, 1.0)
