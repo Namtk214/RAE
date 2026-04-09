@@ -288,8 +288,8 @@ def main():
     model_param_count = sum(p.size for p in jax.tree.leaves(nnx.state(model)))
     logger.info(f"DiT parameters: {model_param_count / 1e6:.2f}M")
 
-    # ── Replicate model state across all devices ──
-    graphdef, model_state = nnx.split(model)
+    # ── Extract model params (Param-only leaves) and replicate ──
+    model_state = nnx.state(model)
     model_state = jax.device_put(model_state, repl_sharding)
 
     # ── EMA (replicated) ──
@@ -389,7 +389,6 @@ def main():
 
     # ─────────────────────────────────────────────────────────────
     # OPT 1: JIT-compiled RAE encode step
-    # Avoids re-tracing on every Python call and keeps encoding on TPU
     # ─────────────────────────────────────────────────────────────
     @jax.jit
     def encode_batch(rae_st, images, rng):
@@ -401,18 +400,16 @@ def main():
         return latents
 
     # ─────────────────────────────────────────────────────────────
-    # OPT 2: JIT train step with donate_argnums
-    # donate_argnums donates the input buffers so JAX can reuse them
-    # without extra allocation (zero-copy param updates on TPU)
+    # OPT 2: JIT train step — uses nnx.update (same pattern as Stage 1)
     # ─────────────────────────────────────────────────────────────
     @partial(jax.jit, donate_argnums=(0, 1, 2))
     def train_step(model_state, opt_state, ema_state, batch_x, batch_y, step_rng):
         """Single training step — fully on-device, no Python sync."""
 
         def loss_fn(params):
-            m = nnx.merge(graphdef, params)
+            nnx.update(model, params)
             def model_forward(xt, t, y):
-                return m(xt, t, y, training=True, rng=step_rng, return_activations=True)
+                return model(xt, t, y, training=True, rng=step_rng, return_activations=True)
 
             terms, acts = transport.training_losses(
                 model_forward, batch_x, step_rng, has_aux=True, y=batch_y,
@@ -458,12 +455,13 @@ def main():
     @jax.jit
     def valid_step(model_state, batch_x, batch_y, step_rng):
         def loss_fn(params):
-            m = nnx.merge(graphdef, params)
+            nnx.update(model, params)
             def model_forward(xt, t, y):
-                return m(xt, t, y, training=False, rng=step_rng)
+                return model(xt, t, y, training=False, rng=step_rng)
             terms = transport.training_losses(model_forward, batch_x, step_rng, y=batch_y)
             return jnp.mean(terms["loss"])
         return loss_fn(model_state)
+
 
     start_time = time.time()
 
@@ -598,7 +596,7 @@ def main():
                         return jax.lax.stop_gradient(rae_model_gen.decode(z))
 
                     _generate_samples(
-                        graphdef, ema_state, eval_sample_fn,
+                        model, ema_state, eval_sample_fn,
                         latent_size, labels[:8], rng,
                         use_guidance, guidance_scale, null_label,
                         global_step, args.wandb,
@@ -642,7 +640,8 @@ def main():
                     except Exception:
                         pass
                         
-                    eval_model = nnx.merge(graphdef, ema_state)
+                    nnx.update(model, ema_state)
+                    eval_model = model
                     rae_model_eval = nnx.merge(rae_graphdef, rae_state)
                     
                     @jax.jit
@@ -684,7 +683,7 @@ def main():
     logger.info("Training complete!")
 
 
-def _generate_samples(graphdef, ema_state, sample_fn, latent_size,
+def _generate_samples(model, ema_state, sample_fn, latent_size,
                       labels, rng, use_guidance, cfg_scale, null_label,
                       global_step, use_wandb, rae_decode_fn=None):
     """Generate visual samples using EMA model (on main process only)."""
@@ -692,7 +691,8 @@ def _generate_samples(graphdef, ema_state, sample_fn, latent_size,
     rng, noise_rng = jax.random.split(rng)
     z = jax.random.normal(noise_rng, (n, *latent_size))
 
-    ema_model = nnx.merge(graphdef, ema_state)
+    nnx.update(model, ema_state)
+    ema_model = model
 
     log_every = 10
     if use_guidance:
