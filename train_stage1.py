@@ -491,22 +491,174 @@ def train(config):
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
+
+# ── Hardcoded constants (change here if needed, not via CLI) ─────────────
+# Optimizer / schedule
+_BETAS           = (0.9, 0.95)
+_WEIGHT_DECAY    = 0.0
+_EMA_DECAY       = 0.9978
+_CLIP_GRAD       = 0.0
+_SCHEDULE_TYPE   = "cosine"
+_WARMUP_EPOCHS   = 1
+_FINAL_LR        = 2e-5
+
+# Logging / checkpointing
+_LOG_INTERVAL    = 50
+_SAMPLE_EVERY    = 500
+_CKPT_INTERVAL   = 1   # in epochs
+
+# RAE encoder / decoder
+_ENCODER_CLS         = "Dinov2withNorm"
+_ENCODER_CONFIG_PATH = "facebook/dinov2-base"
+_ENCODER_INPUT_SIZE  = 224
+_DINOV2_PATH         = "facebook/dinov2-base"
+_DECODER_CONFIG_PATH = "configs/decoder/ViTXL"
+_NOISE_TAU           = 0.8
+
+# Discriminator architecture
+_DISC_CKPT_PATH  = "models/discs/dino_vit_small_patch8_224.pth"
+_DISC_KS         = 9
+_DISC_NORM_TYPE  = "bn"
+_DISC_RECIPE     = "S_8"
+_DIFFAUG_PROB    = 1.0
+
+# GAN / loss schedule (epoch-based thresholds)
+_DISC_LOSS_TYPE   = "hinge"
+_DISC_WEIGHT      = 0.75
+_PERCEPTUAL_WEIGHT = 1.0
+_DISC_START       = 8    # epoch to start generator GAN loss
+_DISC_UPD_START   = 6    # epoch to start updating discriminator
+_LPIPS_START      = 0
+_MAX_D_WEIGHT     = 10000.0
+
+
 def main():
-    parser = argparse.ArgumentParser(description="RAE Stage 1 Training (JAX)")
-    parser.add_argument("--config", type=str, default="configs/DINOv2-B_decXL.yaml",
-                        help="Path to config YAML")
-    parser.add_argument("--wandb", action="store_true", default=False,
-                        help="Enable WandB logging")
-    parser.add_argument("--results_dir", type=str, default=None,
-                        help="Override results directory")
+    parser = argparse.ArgumentParser(
+        description="RAE Stage 1 Training (JAX)",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+
+    # ── Paths ────────────────────────────────────────────────────────
+    parser.add_argument("--data-dir", type=str, required=True,
+                        help="Dataset directory (TFDS data_dir or ImageFolder root)")
+    parser.add_argument("--results-dir", type=str, default="ckpts/stage1",
+                        help="Root directory where checkpoints are saved")
+    parser.add_argument("--experiment-name", type=str, default="stage1_run",
+                        help="Sub-folder name inside results-dir")
+
+    # ── Data source ──────────────────────────────────────────────────
+    parser.add_argument("--data-source", type=str, default="tfds",
+                        choices=["tfds", "imagefolder"])
+    parser.add_argument("--dataset-name", type=str, default="celebahq256",
+                        help="TFDS dataset name (celebahq256, imagenet2012, …)")
+    parser.add_argument("--tfds-builder-dir", type=str, default=None,
+                        help="Path to custom TFDS builder directory (optional)")
+    parser.add_argument("--image-size", type=int, default=256)
+    parser.add_argument("--num-train-samples", type=int, default=30000,
+                        help="Dataset size — used to compute steps/epoch")
+
+    # ── Training knobs ───────────────────────────────────────────────
+    parser.add_argument("--epochs", type=int, default=16)
+    parser.add_argument("--global-batch-size", type=int, default=128,
+                        help="Total batch across all TPU devices")
+    parser.add_argument("--lr", type=float, default=2e-4,
+                        help="Peak learning rate (cosine schedule)")
+    parser.add_argument("--seed", type=int, default=42)
+
+    # ── WandB ───────────────────────────────────────────────────────
+    parser.add_argument("--wandb", action="store_true", default=False)
+    parser.add_argument("--wandb-project", type=str, default="rae-jax-stage1")
+    parser.add_argument("--wandb-entity", type=str, default="")
+
     args = parser.parse_args()
 
-    config = OmegaConf.load(args.config)
-
-    if args.wandb:
-        config.wandb.enabled = True
-    if args.results_dir:
-        config.experiment.results_dir = args.results_dir
+    # ── Build OmegaConf config from CLI + constants ──────────────────
+    config = OmegaConf.create({
+        "stage_1": {
+            "params": {
+                "encoder_cls": _ENCODER_CLS,
+                "encoder_config_path": _ENCODER_CONFIG_PATH,
+                "encoder_input_size": _ENCODER_INPUT_SIZE,
+                "encoder_params": {"dinov2_path": _DINOV2_PATH, "normalize": True},
+                "decoder_config_path": _DECODER_CONFIG_PATH,
+                "noise_tau": _NOISE_TAU,
+                "reshape_to_2d": True,
+            },
+        },
+        "experiment": {
+            "results_dir": args.results_dir,
+            "experiment_name": args.experiment_name,
+        },
+        "data": {
+            "source": args.data_source,
+            "dataset_name": args.dataset_name,
+            "data_dir": args.data_dir,
+            "tfds_builder_dir": args.tfds_builder_dir,
+            "image_size": args.image_size,
+            "num_train_samples": args.num_train_samples,
+        },
+        "wandb": {
+            "enabled": args.wandb,
+            "project": args.wandb_project,
+            "experiment_name": args.experiment_name,
+            "entity": args.wandb_entity,
+        },
+        "training": {
+            "seed": args.seed,
+            "epochs": args.epochs,
+            "ema_decay": _EMA_DECAY,
+            "global_batch_size": args.global_batch_size,
+            "clip_grad": _CLIP_GRAD,
+            "log_interval": _LOG_INTERVAL,
+            "sample_every": _SAMPLE_EVERY,
+            "checkpoint_interval": _CKPT_INTERVAL,
+            "optimizer": {
+                "lr": args.lr,
+                "betas": list(_BETAS),
+                "weight_decay": _WEIGHT_DECAY,
+            },
+            "scheduler": {
+                "type": _SCHEDULE_TYPE,
+                "warmup_epochs": _WARMUP_EPOCHS,
+                "final_lr": _FINAL_LR,
+                "warmup_from_zero": True,
+            },
+        },
+        "gan": {
+            "disc": {
+                "arch": {
+                    "dino_ckpt_path": _DISC_CKPT_PATH,
+                    "ks": _DISC_KS,
+                    "norm_type": _DISC_NORM_TYPE,
+                    "using_spec_norm": True,
+                    "recipe": _DISC_RECIPE,
+                },
+                "optimizer": {
+                    "lr": args.lr,       # disc mirrors gen LR
+                    "betas": list(_BETAS),
+                    "weight_decay": _WEIGHT_DECAY,
+                },
+                "scheduler": {
+                    "type": _SCHEDULE_TYPE,
+                    "warmup_epochs": _WARMUP_EPOCHS,
+                    "final_lr": _FINAL_LR,
+                    "warmup_from_zero": True,
+                },
+                "augment": {"prob": _DIFFAUG_PROB, "cutout": 0.0},
+            },
+            "loss": {
+                "disc_loss": _DISC_LOSS_TYPE,
+                "gen_loss": "vanilla",
+                "disc_weight": _DISC_WEIGHT,
+                "perceptual_weight": _PERCEPTUAL_WEIGHT,
+                "disc_start": _DISC_START,
+                "disc_upd_start": _DISC_UPD_START,
+                "lpips_start": _LPIPS_START,
+                "max_d_weight": _MAX_D_WEIGHT,
+                "disc_updates": 1,
+            },
+        },
+    })
 
     train(config)
 

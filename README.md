@@ -2,13 +2,14 @@
 
 ### [Paper](https://arxiv.org/abs/2510.11690) | [Project Page](https://rae-dit.github.io/) | [PyTorch](https://github.com/bytetriper/RAE)
 
-JAX/Flax NNX port of [RAE](https://github.com/bytetriper/RAE), optimized for **TPUv4e-8** data-parallel training.
+JAX/Flax NNX port of [RAE](https://github.com/bytetriper/RAE), optimised for **TPU v5e-8** data-parallel training.  
+No YAML config file required — all parameters are passed directly as CLI flags.
 
 ---
 
 ## Environment
 
-### TPU Setup (Kaggle / GCP)
+### Install dependencies
 
 ```bash
 pip install -r requirements.txt
@@ -21,6 +22,13 @@ import jax
 print(jax.devices())  # Should show 8 TPU cores
 ```
 
+### WandB
+
+```bash
+export WANDB_KEY="your_wandb_api_key"
+export ENTITY="your_wandb_entity"
+```
+
 ---
 
 ## Project Structure
@@ -28,150 +36,163 @@ print(jax.devices())  # Should show 8 TPU cores
 ```
 rae_jax/
 ├── configs/
-│   ├── decoder/ViTXL/config.json        # ViT-XL decoder architecture
-│   ├── stage1/
-│   │   ├── pretrained/                   # Inference-only configs
-│   │   │   ├── DINOv2-B.yaml
-│   │   │   ├── DINOv2-B_512.yaml
-│   │   │   └── MAE.yaml
-│   │   └── training/
-│   │       └── DINOv2-B_decXL.yaml       # Stage 1 training config
-│   └── stage2/
-│       ├── training/
-│       │   ├── ImageNet256/
-│       │   │   ├── DiTDH-XL_DINOv2-B.yaml
-│       │   │   └── DiTDH-S_DINOv2-B.yaml
-│       │   └── ImageNet512/
-│       │       └── DiTDH-XL_DINOv2-B.yaml
-│       └── sampling/
-│           ├── ImageNet256/
-│           │   ├── DiTDHXL-DINOv2-B.yaml      # CFG sampling
-│           │   └── DiTDHXL-DINOv2-B_AG.yaml   # AutoGuidance
-│           └── ImageNet512/
-│               └── DiTDH-XL_DINOv2-B_decXL_AG.yaml
-├── stage1/                # RAE Autoencoder
-├── stage2/                # DiT Diffusion Model
-├── disc/                  # Discriminator (Stage 1)
-├── eval/                  # Distributed Evaluation
-├── utils/                 # Device, Optimizer, Checkpoint utils
-├── train_stage1.py        # Stage 1 training
-├── train.py               # Stage 2 training
-├── calculate_stat.py      # Latent normalization statistics
-├── sample.py              # Single-device sampling
-├── sample_ddp.py          # Distributed sampling
-├── stage1_sample.py       # Stage 1 reconstruction demo
-├── stage1_sample_ddp.py   # Distributed Stage 1 reconstruction
-├── extract_decoder.py     # Extract decoder weights
-└── data.py                # tf.data / ImageFolder pipeline
+│   └── decoder/ViTXL/config.json   # ViT-XL decoder architecture (read-only)
+├── stage1/                          # RAE Autoencoder
+├── stage2/                          # DiT Diffusion Model
+├── disc/                            # Discriminator (Stage 1)
+├── eval/                            # FID & IQA utilities
+├── utils/                           # Device, Optimizer, Checkpoint helpers
+├── train_stage1.py                  # Stage 1 training  ← main entry point
+├── train.py                         # Stage 2 training  ← main entry point
+├── calculate_stat.py                # Latent normalization statistics
+├── extract_decoder.py               # Extract decoder weights from Stage 1 ckpt
+├── sample.py                        # Single-device sampling
+├── sample_ddp.py                    # Distributed sampling
+├── stage1_sample.py                 # Single-image Stage 1 reconstruction
+├── stage1_sample_ddp.py             # Distributed Stage 1 reconstruction
+└── data.py                          # tf.data / ImageFolder pipeline
 ```
 
 ---
 
 ## Data Preparation
 
-### ImageNet
+### ImageNet-1K
 
 ```bash
-# Download ImageNet-1k train/val splits
-# Organize as ImageFolder: data/imagenet/train/<class_id>/*.JPEG
+# Organize as ImageFolder:
+#   data/imagenet/train/<class_id>/*.JPEG
+#   data/imagenet/val/<class_id>/*.JPEG
 ```
 
 ### CelebA-HQ 256
 
 ```bash
-# If using TFDS builder:
-# Set data.source=tfds and data.dataset_name=celebahq256 in config
+# Option A — TFDS (auto-download via tfds_builders):
+#   --data-source tfds --dataset-name celebahq256
 
-# If using ImageFolder:
-# Organize as: data/celebahq256/train/<class>/*.png
+# Option B — ImageFolder:
+#   data/celebahq256/train/<class>/*.png
+#   --data-source imagefolder
 ```
 
 ---
 
 ## Stage 1: Representation Autoencoder
 
-### 1. Calculate Encoder Statistics
+Stage 1 trains a ViT-XL decoder to reconstruct images from frozen DINOv2 encoder latents.
 
-Before training, compute the mean/variance of encoder outputs for latent normalization:
+### Step 1 — Compute Latent Normalization Stats
+
+Run once before training to compute encoder mean/variance used to normalize latents:
 
 ```bash
 python calculate_stat.py \
   --config configs/stage1/pretrained/DINOv2-B.yaml \
-  --data-path data/imagenet/train \
-  --output-dir models/stats/dinov2 \
+  --data-path data/celebahq256/train \
+  --output-dir models/stats/dinov2_celebahq256 \
   --image-size 256 \
-  --batch-size 64 \
-  --num-samples 50000
+  --batch-size 32 \
+  --num-samples 30000 \
+  --dataset-type imagefolder
 ```
 
-> **Note**: Statistics should be computed **without** a pre-computed `normalization_stat_path` in the config. The script uses Welford's online algorithm for numerical stability.
+Output: `models/stats/dinov2_celebahq256/stats.npz` (keys: `mean`, `var`)
 
-### 2. Train the Decoder
+---
 
-Train the ViT-XL decoder while keeping the DINOv2 encoder frozen:
+### Step 2 — Train the Decoder
 
 ```bash
 python train_stage1.py \
-  --config configs/stage1/training/DINOv2-B_decXL.yaml \
+  --data-dir /data/celebahq256 \
+  --data-source tfds \
+  --dataset-name celebahq256 \
+  --num-train-samples 30000 \
+  --results-dir ckpts/stage1 \
+  --experiment-name celebahq256_dinov2b_decXL \
+  --epochs 16 \
+  --global-batch-size 128 \
+  --lr 2e-4 \
+  --wandb \
+  --wandb-project rae-jax-stage1
+```
+
+**ImageNet** variant:
+
+```bash
+python train_stage1.py \
+  --data-dir /data/imagenet \
+  --data-source imagefolder \
+  --dataset-name imagenet2012 \
+  --num-train-samples 1281167 \
+  --results-dir ckpts/stage1 \
+  --experiment-name imagenet_dinov2b_decXL \
+  --epochs 16 \
+  --global-batch-size 512 \
+  --lr 2e-4 \
   --wandb
 ```
 
-**Key training config parameters** (`DINOv2-B_decXL.yaml`):
+Training auto-resumes from the latest checkpoint if `results-dir/experiment-name/checkpoints/` already exists.
 
-| Parameter | Value | Description |
-|-----------|-------|-------------|
-| `training.epochs` | 16 | Total training epochs |
-| `training.global_batch_size` | 512 | Global batch (÷8 = 64/device) |
-| `training.ema_decay` | 0.9978 | EMA decay rate |
-| `training.optimizer.lr` | 2e-4 | AdamW learning rate |
-| `training.optimizer.betas` | [0.9, 0.95] | Adam betas |
-| `training.scheduler.type` | cosine | LR schedule |
-| `training.scheduler.warmup_epochs` | 1 | Warmup epochs |
-| `training.scheduler.final_lr` | 2e-5 | Final LR |
-| `stage_1.noise_tau` | 0.8 | Training noise (set 0 at inference) |
-| `gan.loss.disc_start` | 8 | Start GAN loss at epoch 8 |
-| `gan.loss.lpips_start` | 0 | Start LPIPS at epoch 0 |
-| `gan.loss.disc_weight` | 0.75 | GAN loss weight |
+**Hardcoded defaults** (edit at the top of `train_stage1.py` to change):
 
-**Logging**: Set environment variables for WandB:
+| Constant | Value | Description |
+|----------|-------|-------------|
+| `_EMA_DECAY` | 0.9978 | EMA decay rate |
+| `_SCHEDULE_TYPE` | cosine | LR schedule |
+| `_WARMUP_EPOCHS` | 1 | Warmup epochs |
+| `_FINAL_LR` | 2e-5 | Final learning rate |
+| `_DISC_START` | 8 | Epoch to activate GAN loss |
+| `_DISC_UPD_START` | 6 | Epoch to start updating discriminator |
+| `_LPIPS_START` | 0 | Epoch to activate LPIPS |
+| `_DISC_WEIGHT` | 0.75 | GAN loss weight |
+| `_PERCEPTUAL_WEIGHT` | 1.0 | LPIPS weight |
+| `_ENCODER_CLS` | `Dinov2withNorm` | Encoder architecture |
+| `_DECODER_CONFIG_PATH` | `configs/decoder/ViTXL` | Decoder config |
 
-```bash
-export WANDB_KEY="your_key"
-export ENTITY="your_entity"
-export PROJECT="rae-jax-stage1"
-```
+---
 
-**Resuming**: The training script auto-resumes from the latest checkpoint in the results directory.
+### Step 3 — Reconstruct Images
 
-### 3. Reconstruct Images
-
-Single image reconstruction:
+**Single image:**
 
 ```bash
 python stage1_sample.py \
   --config configs/stage1/pretrained/DINOv2-B.yaml \
-  --image assets/test.png
+  --image assets/test.png \
+  --output recon.png \
+  --image-size 256 \
+  --ckpt-dir ckpts/stage1/celebahq256_dinov2b_decXL/checkpoints \
+  --use-ema
 ```
 
-Distributed batch reconstruction (all 8 TPU cores):
+**Distributed batch reconstruction (all TPU cores):**
 
 ```bash
 python stage1_sample_ddp.py \
   --config configs/stage1/pretrained/DINOv2-B.yaml \
-  --data-path data/imagenet/val \
-  --output-dir samples/recon \
+  --data-path data/celebahq256/val \
+  --output-dir samples/recon_val \
   --batch-size 8 \
-  --image-size 256
+  --num-samples 30000 \
+  --image-size 256 \
+  --dataset-type imagefolder \
+  --ckpt-dir ckpts/stage1/celebahq256_dinov2b_decXL/checkpoints \
+  --use-ema
 ```
 
-### 4. Extract Decoder Weights
+---
 
-Save a standalone decoder checkpoint:
+### Step 4 — Extract Decoder Weights
+
+Extract a standalone decoder `.npz` from a Stage 1 checkpoint for use in Stage 2:
 
 ```bash
 python extract_decoder.py \
   --config configs/stage1/training/DINOv2-B_decXL.yaml \
-  --ckpt ckpts/stage1/checkpoints/ep-0000016 \
+  --ckpt ckpts/stage1/celebahq256_dinov2b_decXL/checkpoints/ckpt_0000016.pkl \
   --use-ema \
   --out models/decoders/dinov2/wReg_base/ViTXL_n08/model.npz
 ```
@@ -180,120 +201,113 @@ python extract_decoder.py \
 
 ## Stage 2: Latent Diffusion Transformer
 
-### 1. Train DiT<sup>DH</sup>
+Stage 2 trains a flow-matching DiT on RAE latent space.
 
-Train the flow-matching diffusion transformer on RAE latents:
+### Step 1 — Train DiT (XL, ~675M params)
+
+**CelebAHQ-256:**
 
 ```bash
 python train.py \
-  --config configs/stage2/training/ImageNet256/DiTDH-XL_DINOv2-B.yaml \
-  --data-path data/imagenet/train \
+  --data-path /data/celebahq256 \
+  --dataset-type tfds \
+  --tfds-name celebahq256 \
+  --num-train-samples 30000 \
+  --rae-checkpoint ckpts/stage1/celebahq256_dinov2b_decXL/checkpoints/ckpt_last.pkl \
+  --normalization-stat-path models/stats/dinov2_celebahq256/stats.npz \
   --results-dir ckpts/stage2 \
-  --image-size 256 \
-  --precision bf16 \
-  --wandb
+  --experiment-name celebahq256_xl \
+  --epochs 1400 \
+  --global-batch-size 1024 \
+  --lr 2e-4 \
+  --eval-fid-every 25000 \
+  --num-fid-samples 10000 \
+  --wandb \
+  --wandb-project rae-jax-stage2
 ```
 
-**Key training config parameters** (`DiTDH-XL_DINOv2-B.yaml`):
-
-| Parameter | Value | Description |
-|-----------|-------|-------------|
-| `training.epochs` | 1400 | Total training epochs |
-| `training.global_batch_size` | 1024 | Global batch (÷8 = 128/device) |
-| `training.ema_decay` | 0.9995 | EMA decay rate |
-| `training.clip_grad` | 1.0 | Gradient clipping norm |
-| `training.optimizer.lr` | 2e-4 | AdamW learning rate |
-| `training.scheduler.type` | linear | LR schedule (linear decay) |
-| `training.scheduler.warmup_epochs` | 40 | Warmup epochs |
-| `training.scheduler.decay_end_epoch` | 800 | Decay end |
-| `transport.params.path_type` | Linear | Flow matching path |
-| `transport.params.time_dist_type` | logit-normal_0_1 | Time distribution |
-| `stage_2.params.hidden_size` | [1152, 2048] | Encoder, Decoder dim |
-| `stage_2.params.depth` | [28, 2] | 28 enc + 2 dec blocks |
-| `stage_2.params.num_heads` | [16, 16] | Attention heads |
-
-**Smaller model** (DiTDH-S, for distillation / autoguidance):
+**ImageNet-256:**
 
 ```bash
 python train.py \
-  --config configs/stage2/training/ImageNet256/DiTDH-S_DINOv2-B.yaml \
-  --data-path data/imagenet/train \
-  --results-dir ckpts/stage2-small \
-  --precision bf16 \
+  --data-path /data/imagenet \
+  --dataset-type imagefolder \
+  --num-train-samples 1281167 \
+  --rae-checkpoint ckpts/stage1/imagenet_dinov2b_decXL/checkpoints/ckpt_last.pkl \
+  --normalization-stat-path models/stats/dinov2_imagenet/stats.npz \
+  --reference-npz-path data/imagenet/VIRTUAL_imagenet256_labeled.npz \
+  --results-dir ckpts/stage2 \
+  --experiment-name imagenet256_xl \
+  --epochs 1400 \
+  --global-batch-size 1024 \
+  --lr 2e-4 \
+  --eval-fid-every 25000 \
+  --num-fid-samples 10000 \
   --wandb
 ```
 
-**Online evaluation**: Add the `eval` block in config:
+**Hardcoded defaults** (edit at the top of `train.py` to change):
 
-```yaml
-eval:
-  eval_interval: 25000      # Every N training steps
-  eval_model: true
-  data_path: 'data/imagenet/val/'
-  reference_npz_path: 'data/imagenet/VIRTUAL_imagenet256_labeled.npz'
-```
+| Constant | Value | Description |
+|----------|-------|-------------|
+| `_EMA_DECAY` | 0.9995 | EMA decay rate |
+| `_SCHEDULE_TYPE` | linear | LR schedule |
+| `_WARMUP_EPOCHS` | 40 | Warmup epochs |
+| `_FINAL_LR` | 2e-5 | Final LR |
+| `_CLIP_GRAD` | 1.0 | Gradient clip norm |
+| `_HIDDEN_SIZE` | [1152, 2048] | DiT hidden dims (XL) |
+| `_DEPTH` | [28, 2] | DiT depth (XL) |
+| `_IN_CHANNELS` | 768 | Latent channels (DINOv2-B) |
+| `_PATH_TYPE` | Linear | Flow matching path |
+| `_TIME_DIST_TYPE` | logit-normal_0_1 | Time distribution |
+| `_NUM_STEPS` | 50 | ODE steps at eval |
 
-### 2. Sample Images
+> To switch to the **Small model** (DiTDH-S, ~130M), change `_HIDDEN_SIZE = [384, 2048]` and `_DEPTH = [12, 2]` in `train.py`.
 
-Single-device CFG sampling:
+---
+
+### Step 2 — Sample Images
+
+**Single-device CFG sampling:**
 
 ```bash
 python sample.py \
   --config configs/stage2/sampling/ImageNet256/DiTDHXL-DINOv2-B.yaml \
   --seed 42 \
-  --cfg-scale 1.5
+  --cfg-scale 1.5 \
+  --class-labels 207 360 387 974 88 979 417 279 \
+  --output-dir samples/gen_cfg15 \
+  --ckpt-dir ckpts/stage2/imagenet256_xl/checkpoints \
+  --rae-ckpt-dir ckpts/stage1/imagenet_dinov2b_decXL/checkpoints \
+  --use-ema
 ```
 
-Distributed sampling (FID-50k ready):
+**Distributed sampling (FID-50k ready):**
 
 ```bash
 python sample_ddp.py \
   --config configs/stage2/sampling/ImageNet256/DiTDHXL-DINOv2-B.yaml \
-  --sample-dir samples/gen \
-  --num-fid-samples 50000
+  --sample-dir samples/fid50k \
+  --num-fid-samples 50000 \
+  --batch-size 16 \
+  --seed 0 \
+  --cfg-scale 1.5 \
+  --ckpt-dir ckpts/stage2/imagenet256_xl/checkpoints \
+  --rae-ckpt-dir ckpts/stage1/imagenet_dinov2b_decXL/checkpoints \
+  --use-ema
 ```
 
-**AutoGuidance** sampling (uses a smaller guidance model):
+**AutoGuidance sampling:**
 
 ```bash
 python sample_ddp.py \
   --config configs/stage2/sampling/ImageNet256/DiTDHXL-DINOv2-B_AG.yaml \
-  --sample-dir samples/gen_ag
+  --sample-dir samples/gen_ag \
+  --num-fid-samples 50000 \
+  --batch-size 16 \
+  --ckpt-dir ckpts/stage2/imagenet256_xl/checkpoints \
+  --use-ema
 ```
-
----
-
-## TPU Parallelism
-
-All training scripts use **mesh-based data parallelism** for TPU:
-
-```
-┌──────────────────────────────────────────────────┐
-│ Mesh("data", 8)                                  │
-│                                                  │
-│  Core 0   Core 1   Core 2  ...  Core 7          │
-│  ┌─────┐  ┌─────┐  ┌─────┐     ┌─────┐         │
-│  │B/8  │  │B/8  │  │B/8  │     │B/8  │  ← Data  │
-│  │     │  │     │  │     │     │     │  sharded  │
-│  └──┬──┘  └──┬──┘  └──┬──┘     └──┬──┘         │
-│     │        │        │           │              │
-│  ┌──▼──┐  ┌──▼──┐  ┌──▼──┐     ┌──▼──┐         │
-│  │Model│  │Model│  │Model│     │Model│  ← Params │
-│  │Copy │  │Copy │  │Copy │     │Copy │  replicated│
-│  └──┬──┘  └──┬──┘  └──┬──┘     └──┬──┘         │
-│     │        │        │           │              │
-│     └────────┴────────┴───────────┘              │
-│              ↓ XLA auto all-reduce               │
-│         Synchronized gradients                   │
-└──────────────────────────────────────────────────┘
-```
-
-**Key design decisions**:
-
-- **No `jax.pmap`**: We use `jax.sharding.Mesh` + `NamedSharding` instead. Data is sharded with `P("data")`, params are replicated with `P()`.
-- **Auto gradient reduction**: When computing `grad(loss)` on sharded data w.r.t. replicated params, XLA automatically inserts an all-reduce mean.
-- **bfloat16**: Enabled by default (`--precision bf16`) for 2× throughput on TPU.
-- **Gradient checkpointing**: Available via `nnx.remat` for large models.
 
 ---
 
@@ -302,23 +316,35 @@ All training scripts use **mesh-based data parallelism** for TPU:
 ### FID with ADM Suite
 
 ```bash
-# Download reference stats
+# 1. Generate reference FID stats (one-time)
+python eval/create_fid_ref.py \
+  --data-path data/imagenet/train \
+  --out-path data/imagenet/VIRTUAL_imagenet256_labeled.npz \
+  --image-size 256 \
+  --batch-size 64 \
+  --num-samples 50000 \
+  --dataset-type imagefolder \
+  --split train
+
+# 2. Or download OpenAI pre-computed reference
 wget https://openaipublic.blob.core.windows.net/diffusion/jul-2021/ref_batches/imagenet/256/VIRTUAL_imagenet256_labeled.npz
 
-# Generate 50k samples
+# 3. Generate 50k samples
 python sample_ddp.py \
-  --config configs/stage2/sampling/ImageNet256/DiTDHXL-DINOv2-B_AG.yaml \
-  --sample-dir samples/fid \
-  --num-fid-samples 50000
+  --config configs/stage2/sampling/ImageNet256/DiTDHXL-DINOv2-B.yaml \
+  --sample-dir samples/fid50k_cfg15 \
+  --num-fid-samples 50000 \
+  --batch-size 16 \
+  --cfg-scale 1.5 \
+  --ckpt-dir ckpts/stage2/imagenet256_xl/checkpoints \
+  --use-ema
 
-# Score with ADM evaluator
-cd guided-diffusion/evaluation
-python evaluator.py VIRTUAL_imagenet256_labeled.npz /path/to/samples.npz
+# 4. Score
+cd guided-diffusion/evaluations
+python evaluator.py VIRTUAL_imagenet256_labeled.npz /path/to/samples/fid50k_cfg15/samples_*.npz
 ```
 
-### Built-in Metrics
-
-Run standalone metric computation:
+### Built-in Metrics (PSNR / SSIM / LPIPS / rFID)
 
 ```bash
 python -m eval \
@@ -327,41 +353,37 @@ python -m eval \
   --bs 128
 ```
 
-This computes **PSNR**, **SSIM**, **LPIPS**, and **rFID**.
+---
+
+## TPU Parallelism
+
+All training scripts use **mesh-based data parallelism** — no `jax.pmap`:
+
+```
+Mesh("data", 8)
+
+  Core 0 … Core 7
+  ┌─────┐   ┌─────┐
+  │ B/8 │   │ B/8 │   ← data SHARDED  P("data")
+  └──┬──┘   └──┬──┘
+  ┌──▼──┐   ┌──▼──┐
+  │Model│   │Model│   ← params REPLICATED  P()
+  └──┬──┘   └──┬──┘
+     └────┬────┘
+     XLA all-reduce
+  (auto gradient sync)
+```
+
+- **bfloat16** (`--precision bf16`) for 2× TPU throughput
+- **`donate_argnums`** for zero-copy parameter updates
+- **Gradient checkpointing** available via `nnx.remat` for large models
 
 ---
 
-## Config Reference
-
-### Config Sections
-
-| Section | Stage 1 | Stage 2 | Sampling | Description |
-|---------|:-------:|:-------:|:--------:|-------------|
-| `stage_1` | ✅ | ✅ | ✅ | RAE encoder + decoder definition |
-| `stage_2` | — | ✅ | ✅ | DiT model definition |
-| `transport` | — | ✅ | ✅ | Flow matching path & loss |
-| `sampler` | — | ✅ | ✅ | ODE/SDE solver settings |
-| `guidance` | — | ✅ | ✅ | CFG or AutoGuidance |
-| `misc` | — | ✅ | ✅ | Latent size, class count |
-| `training` | ✅ | ✅ | — | Epochs, LR, EMA, etc. |
-| `eval` | ✅ | ✅ | — | Online eval settings |
-| `gan` | ✅ | — | — | Discriminator + LPIPS loss |
-
-### Stage 2 Model Variants
-
-| Model | hidden_size | depth | #Params | Config |
-|-------|-------------|-------|---------|--------|
-| DiTDH-S | [384, 2048] | [12, 2] | ~130M | `DiTDH-S_DINOv2-B.yaml` |
-| DiTDH-XL | [1152, 2048] | [28, 2] | ~675M | `DiTDH-XL_DINOv2-B.yaml` |
-
----
-
-## Acknowledgement
-
-This code is built upon:
+## Acknowledgements
 
 - [RAE](https://github.com/bytetriper/RAE) — Original PyTorch implementation
-- [SiT](https://github.com/willisma/sit) — Diffusion implementation
+- [SiT](https://github.com/willisma/sit) — Flow matching diffusion
 - [DDT](https://github.com/MCG-NJU/DDT) — DiT<sup>DH</sup> architecture
 - [LightningDiT](https://github.com/hustvl/LightningDiT/) — Single-stream DiT
 - [MAE](https://github.com/facebookresearch/mae) — ViT decoder architecture
