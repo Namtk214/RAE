@@ -170,8 +170,8 @@ def main():
                     lambda x: jnp.array(x) if isinstance(x, np.ndarray) else x,
                     raw_state,
                 )
-                nnx.update(rae, raw_state)
-                logger.info("RAE weights loaded successfully.")
+                nnx.update(rae.decoder, raw_state)
+                logger.info("RAE decoder weights loaded successfully.")
             else:
                 logger.warning("Checkpoint has no 'ema' or 'model' key — using random RAE weights!")
         except Exception as e:
