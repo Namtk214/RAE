@@ -392,8 +392,25 @@ def main():
     # ── Resume from Stage 2 checkpoint if available ──
     restored_ckpt, restored_step = restore_checkpoint(ckpt_mngr)
     global_step_resume = 0
+
+    # Debug: print param stats BEFORE restore
+    def _param_stats(state, label):
+        leaves = jax.tree.leaves(state)
+        all_vals = [np.asarray(l).ravel() for l in leaves if hasattr(l, 'shape') and l.size > 0]
+        if all_vals:
+            cat = np.concatenate(all_vals)
+            logger.info(f"  [{label}] #params={cat.size:,}  mean={cat.mean():.6f}  std={cat.std():.6f}  "
+                        f"min={cat.min():.6f}  max={cat.max():.6f}")
+        else:
+            logger.info(f"  [{label}] (no params found)")
+
+    logger.info("=== DEBUG: DiT param stats BEFORE checkpoint restore ===")
+    _param_stats(model_state, "model_state")
+    _param_stats(ema_state, "ema_state")
+
     if restored_ckpt is not None:
         logger.info(f"Resuming DiT from Stage 2 checkpoint at step {restored_step}...")
+        logger.info(f"  Checkpoint keys: {list(restored_ckpt.keys())}")
         model_state = jax.device_put(
             jax.tree.map(lambda x: jnp.array(x) if isinstance(x, np.ndarray) else x, restored_ckpt["model"]),
             repl_sharding,
@@ -412,9 +429,14 @@ def main():
             except Exception as e:
                 logger.warning(f"Could not restore optimizer state (will use fresh): {e}")
         global_step_resume = restored_step
-        logger.info(f"Resumed successfully from step {restored_step}.")
+
+        # Debug: print param stats AFTER restore
+        logger.info("=== DEBUG: DiT param stats AFTER checkpoint restore ===")
+        _param_stats(model_state, "model_state")
+        _param_stats(ema_state, "ema_state")
+        logger.info(f"✅ Resumed successfully from step {restored_step}.")
     else:
-        logger.info("No Stage 2 checkpoint found — starting from scratch with random DiT weights.")
+        logger.info("⚠️ No Stage 2 checkpoint found — starting from scratch with random DiT weights.")
 
     # ── Transport ──
     transport = create_transport(**transport_params_raw, time_dist_shift=time_dist_shift)
@@ -654,6 +676,8 @@ def main():
                 # Visual sampling
                 if sample_every > 0 and global_step % sample_every == 0 and is_main:
                     logger.info("Generating EMA samples...")
+                    logger.info(f"=== DEBUG: EMA state used for SAMPLING at step {global_step} ===")
+                    _param_stats(ema_state, "ema_state_for_sampling")
                     rae_model_gen = nnx.merge(rae_graphdef, rae_state)
                     # Helper decode function for denoise visualization
                     @jax.jit
@@ -705,6 +729,8 @@ def main():
                     except Exception:
                         pass
                         
+                    logger.info(f"=== DEBUG: EMA state used for FID EVALUATION at step {global_step} ===")
+                    _param_stats(ema_state, "ema_state_for_fid")
                     eval_model = nnx.merge(graphdef, ema_state)
                     rae_model_eval = nnx.merge(rae_graphdef, rae_state)
                     
