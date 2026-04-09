@@ -24,7 +24,7 @@ tensorflow-datasets>=4.9.0
 # ──────────────────────────────────────────────
 # Pretrained Encoders (HuggingFace)
 # ──────────────────────────────────────────────
-transformers>=4.40.0
+transformers>=4.40.0,<5.0.0  # v5.0+ dropped Flax models (FlaxDinov2Model)
 
 # ──────────────────────────────────────────────
 # Eval (lazy-loaded, only at eval time)
