@@ -26,6 +26,16 @@ from utils.train_utils import parse_configs
 from data import build_dataloader
 
 
+def _local_array(x):
+    """Collect addressable (local) shards of a global jax.Array into numpy.
+
+    On single-host this is equivalent to np.array(x).
+    On multi-host it avoids the error from accessing non-local shards.
+    """
+    local_shards = [s.data for s in x.addressable_shards]
+    return np.concatenate([np.asarray(s) for s in local_shards], axis=0)
+
+
 def _welford_update(
     count: int,
     mean: np.ndarray,
@@ -106,10 +116,12 @@ def main():
 
     # ── Data ───────────────────────────────────────────────────────
     global_batch_size = args.batch_size * num_devices
+    num_processes = jax.process_count()
+    per_host_batch = global_batch_size // num_processes
     ds, steps = build_dataloader(
         data_path=args.data_path,
         image_size=args.image_size,
-        batch_size=global_batch_size,
+        batch_size=per_host_batch,
         dataset_type=args.dataset_type,
         split="train",
         tfds_name=args.tfds_name,
@@ -122,9 +134,9 @@ def main():
     # ── Probe latent shape (use replicated sharding to avoid divisibility issue) ──
     repl_sharding = get_replicated_sharding(mesh)
     first_batch = next(iter(ds))
-    # Use full batch (divisible by num_devices) with data sharding
-    probe_images = jax.device_put(jnp.asarray(first_batch["image"]), data_sharding)
-    probe_latent = np.array(encode(probe_images))
+    # Use shard_batch for multi-host correct sharding
+    probe_sharded = shard_batch(first_batch, mesh)
+    probe_latent = _local_array(encode(probe_sharded["image"]))
     latent_shape = probe_latent.shape[1:]  # (H, W, C) or (N, C)
     if is_main:
         print(f"[probe] latent shape per sample: {latent_shape}")
@@ -142,8 +154,8 @@ def main():
             if processed >= max_samples:
                 break
 
-            images = jax.device_put(jnp.asarray(step_data["image"]), data_sharding)
-            latents = np.array(encode(images))  # (B, H, W, C) float32
+            sharded = shard_batch(step_data, mesh)
+            latents = _local_array(encode(sharded["image"]))  # (local_B, H, W, C) float32
 
             count, mean, M2 = _welford_update(count, mean, M2, latents)
             processed += latents.shape[0]

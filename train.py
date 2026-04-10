@@ -297,8 +297,12 @@ def main():
         shift_dim = math.prod(latent_size)
     time_dist_shift = math.sqrt(shift_dim / shift_base)
 
+    num_processes = jax.process_count()
+    per_host_batch = global_batch_size // num_processes
     assert global_batch_size % num_devices == 0, \
         f"global_batch_size {global_batch_size} must be divisible by {num_devices} devices"
+    assert global_batch_size % num_processes == 0, \
+        f"global_batch_size {global_batch_size} must be divisible by {num_processes} processes"
 
     use_guidance = guidance_scale > 1.0
     compute_dtype = jnp.bfloat16 if args.precision == "bf16" else jnp.float32
@@ -450,11 +454,11 @@ def main():
     else:
         raise NotImplementedError(f"Sampler mode {sampler_mode}")
 
-    # ── Data ──
+    # ── Data — each host reads per_host_batch rows ──
     ds, steps_per_epoch = build_dataloader(
         data_path=args.data_path,
         image_size=args.image_size,
-        batch_size=global_batch_size,
+        batch_size=per_host_batch,
         dataset_type=dataset_type,
         split="train",
         tfds_name=tfds_name,
@@ -463,7 +467,7 @@ def main():
     ds_valid, _ = build_dataloader(
         data_path=args.data_path,
         image_size=args.image_size,
-        batch_size=global_batch_size,
+        batch_size=per_host_batch,
         dataset_type=dataset_type,
         split="validation" if dataset_type == "tfds" else "val",
         tfds_name=tfds_name,
@@ -570,13 +574,14 @@ def main():
             for _ in steps_iter:
                 step_data = next(ds)
 
-                # OPT 5: Shard image batch directly without intermediate jnp.array()
-                images = jax.device_put(
-                    jnp.asarray(step_data["image"]), data_sharding
-                )
+                # OPT 5: Shard image batch using multi-host-safe shard_batch
+                sharded = shard_batch(step_data, mesh)
+                images = sharded["image"]
                 label_np = step_data.get("label", None)
                 if label_np is not None:
-                    labels = jax.device_put(jnp.asarray(label_np), data_sharding)
+                    labels = sharded.get("label", jax.device_put(
+                        jnp.zeros(images.shape[0], dtype=jnp.int32), data_sharding
+                    ))
                 else:
                     labels = jax.device_put(
                         jnp.zeros(images.shape[0], dtype=jnp.int32), data_sharding
@@ -607,9 +612,10 @@ def main():
                 
                 global_step += 1
 
-                # Checkpoint at specific global steps
-                if checkpoint_interval > 0 and global_step % checkpoint_interval == 0 and is_main:
-                    logger.info(f"Saving checkpoint at step {global_step}...")
+                # Checkpoint at specific global steps — save on ALL workers for multi-host resume
+                if checkpoint_interval > 0 and global_step % checkpoint_interval == 0:
+                    if is_main:
+                        logger.info(f"Saving checkpoint at step {global_step}...")
                     save_checkpoint(
                         ckpt_mngr, global_step,
                         jax.device_get(model_state),
@@ -618,12 +624,8 @@ def main():
                     )
 
                 # Logging — only sync to host every log_interval steps
-                if log_interval > 0 and global_step % log_interval == 0 and is_main:
-                    avg_stats = {k: float(v) / log_interval for k, v in running_stats.items()}
-                    elapsed = time.time() - start_time
-                    steps_per_sec = log_interval / elapsed
-                    
-                    # Compute validation loss on current validation batch
+                if log_interval > 0 and global_step % log_interval == 0:
+                    # All workers must run validation (JIT collective)
                     try:
                         valid_data = next(ds_valid)
                     except TypeError:
@@ -635,10 +637,13 @@ def main():
                             ds_valid = iter(ds_valid)
                             valid_data = next(ds_valid)
                     
-                    valid_images = jax.device_put(jnp.asarray(valid_data["image"]), data_sharding)
+                    valid_sharded = shard_batch(valid_data, mesh)
+                    valid_images = valid_sharded["image"]
                     valid_label_np = valid_data.get("label", None)
                     if valid_label_np is not None:
-                        valid_labels = jax.device_put(jnp.asarray(valid_label_np), data_sharding)
+                        valid_labels = valid_sharded.get("label", jax.device_put(
+                            jnp.zeros(valid_images.shape[0], dtype=jnp.int32), data_sharding
+                        ))
                     else:
                         valid_labels = jax.device_put(jnp.zeros(valid_images.shape[0], dtype=jnp.int32), data_sharding)
                         
@@ -646,38 +651,45 @@ def main():
                     valid_latents = encode_batch(rae_state, valid_images, val_rng)
                     loss_valid = float(valid_step(model_state, valid_latents, valid_labels, val_rng))
 
-                    stats = {
-                        "training/loss": avg_stats["loss"],
-                        "training/loss_valid": loss_valid,
-                        "training/v_magnitude_prime": avg_stats["v_magnitude_prime"],
-                        "training/steps_per_sec": steps_per_sec,
-                        "training/epoch": epoch,
-                        "training/lr": float(optimizer.learning_rate(opt_state[1].count)
-                                          if hasattr(optimizer, 'learning_rate') else lr),
-                    }
-                    for k, v in avg_stats.items():
-                        if k.startswith("activations/"):
-                            stats[f"training/{k}"] = v
+                    # Only log/print on main process
+                    if is_main:
+                        avg_stats = {k: float(v) / log_interval for k, v in running_stats.items()}
+                        elapsed = time.time() - start_time
+                        steps_per_sec = log_interval / elapsed
+
+                        stats = {
+                            "training/loss": avg_stats["loss"],
+                            "training/loss_valid": loss_valid,
+                            "training/v_magnitude_prime": avg_stats["v_magnitude_prime"],
+                            "training/steps_per_sec": steps_per_sec,
+                            "training/epoch": epoch,
+                            "training/lr": float(optimizer.learning_rate(opt_state[1].count)
+                                              if hasattr(optimizer, 'learning_rate') else lr),
+                        }
+                        for k, v in avg_stats.items():
+                            if k.startswith("activations/"):
+                                stats[f"training/{k}"] = v
+                                
+                        if hasattr(steps_iter, "set_postfix"):
+                            steps_iter.set_postfix({
+                                "loss": f"{stats['training/loss']:.4f}",
+                                "val_loss": f"{stats['training/loss_valid']:.4f}",
+                                "lr": f"{stats['training/lr']:.2e}",
+                                "iter/s": f"{steps_per_sec:.2f}"
+                            })
                             
-                    if is_main and hasattr(steps_iter, "set_postfix"):
-                        steps_iter.set_postfix({
-                            "loss": f"{stats['training/loss']:.4f}",
-                            "val_loss": f"{stats['training/loss_valid']:.4f}",
-                            "lr": f"{stats['training/lr']:.2e}",
-                            "iter/s": f"{steps_per_sec:.2f}"
-                        })
-                        
-                    if args.wandb:
-                        wandb_utils.log(stats, step=global_step)
+                        if args.wandb:
+                            wandb_utils.log(stats, step=global_step)
 
                     running_stats = {}
                     start_time = time.time()
 
                 # Visual sampling
-                if sample_every > 0 and global_step % sample_every == 0 and is_main:
-                    logger.info("Generating EMA samples...")
-                    logger.info(f"=== DEBUG: EMA state used for SAMPLING at step {global_step} ===")
-                    _param_stats(ema_state, "ema_state_for_sampling")
+                if sample_every > 0 and global_step % sample_every == 0:
+                    if is_main:
+                        logger.info("Generating EMA samples...")
+                        logger.info(f"=== DEBUG: EMA state used for SAMPLING at step {global_step} ===")
+                        _param_stats(ema_state, "ema_state_for_sampling")
                     rae_model_gen = nnx.merge(rae_graphdef, rae_state)
                     # Helper decode function for denoise visualization
                     @jax.jit
@@ -760,15 +772,15 @@ def main():
                         eval_stats = {f"eval/{k}": v for k, v in eval_stats.items()}
                         wandb_utils.log(eval_stats, step=global_step)
 
-    # Final checkpoint
+    # Final checkpoint — save on ALL workers
     if is_main:
         logger.info("Saving final checkpoint...")
-        save_checkpoint(
-            ckpt_mngr, global_step,
-            jax.device_get(model_state),
-            jax.device_get(ema_state),
-            jax.device_get(opt_state),
-        )
+    save_checkpoint(
+        ckpt_mngr, global_step,
+        jax.device_get(model_state),
+        jax.device_get(ema_state),
+        jax.device_get(opt_state),
+    )
 
     logger.info("Training complete!")
 
@@ -776,7 +788,12 @@ def main():
 def _generate_samples(graphdef, ema_state, sample_fn, latent_size,
                       labels, rng, use_guidance, cfg_scale, null_label,
                       global_step, use_wandb, rae_decode_fn=None):
-    """Generate visual samples using EMA model (on main process only)."""
+    """Generate visual samples using EMA model.
+    
+    IMPORTANT for multi-host: ALL workers must execute every JIT call
+    (sampling + decode) symmetrically. Only the main worker logs to WandB.
+    """
+    is_main = jax.process_index() == 0
     n = min(8, labels.shape[0])
     rng, noise_rng = jax.random.split(rng)
     z = jax.random.normal(noise_rng, (n, *latent_size))
@@ -803,30 +820,36 @@ def _generate_samples(graphdef, ema_state, sample_fn, latent_size,
             return_intermediates=True, log_every=log_every,
         )
 
-    if rae_decode_fn is not None and use_wandb:
+    # ALL workers must call rae_decode_fn (JIT-compiled) to stay in sync.
+    # Only main worker logs decoded images to WandB.
+    if rae_decode_fn is not None:
         num_inter = len(intermediates)
-        print(f"Decoding {num_inter} intermediate denoising steps for WandB...")
+        if is_main:
+            print(f"Decoding {num_inter} intermediate denoising steps...")
 
         for idx, inter_z in enumerate(intermediates):
             ode_step = (idx + 1) * log_every
-            images = np.array(rae_decode_fn(inter_z))
-            images = np.clip(images, 0.0, 1.0)
-            if images.ndim == 4 and images.shape[1] in (1, 3, 4):  # NCHW -> NHWC
-                images = np.transpose(images, (0, 2, 3, 1))
-            wandb_utils.log_image(
-                images,
-                key=f"sample_denoise/step_{ode_step:03d}",
-                step=global_step,
-            )
+            images = np.array(rae_decode_fn(inter_z))  # ALL workers call this
+            if use_wandb and is_main:
+                images = np.clip(images, 0.0, 1.0)
+                if images.ndim == 4 and images.shape[1] in (1, 3, 4):
+                    images = np.transpose(images, (0, 2, 3, 1))
+                wandb_utils.log_image(
+                    images,
+                    key=f"sample_denoise/step_{ode_step:03d}",
+                    step=global_step,
+                )
 
-        # Log final clean sample
+        # Decode final sample — ALL workers call this
         final_images = np.array(rae_decode_fn(samples))
-        final_images = np.clip(final_images, 0.0, 1.0)
-        if final_images.ndim == 4 and final_images.shape[1] in (1, 3, 4):
-            final_images = np.transpose(final_images, (0, 2, 3, 1))
-        wandb_utils.log_image(final_images, key="sample/final", step=global_step)
+        if use_wandb and is_main:
+            final_images = np.clip(final_images, 0.0, 1.0)
+            if final_images.ndim == 4 and final_images.shape[1] in (1, 3, 4):
+                final_images = np.transpose(final_images, (0, 2, 3, 1))
+            wandb_utils.log_image(final_images, key="sample/final", step=global_step)
 
-    print(f"Generated {n} latent samples at step {global_step}")
+    if is_main:
+        print(f"Generated {n} latent samples at step {global_step}")
 
 
 if __name__ == "__main__":

@@ -131,12 +131,13 @@ def restore_checkpoint(
 
 
 def configure_experiment_dirs(results_dir: str, experiment_name: str) -> Tuple[str, str]:
-    """Create experiment and checkpoint directories."""
+    """Create experiment and checkpoint directories on ALL workers."""
     experiment_dir = os.path.join(results_dir, experiment_name)
     checkpoint_dir = os.path.join(experiment_dir, "checkpoints")
 
-    if jax.process_index() == 0:
-        os.makedirs(experiment_dir, exist_ok=True)
-        os.makedirs(checkpoint_dir, exist_ok=True)
+    # All workers must create dirs so checkpoint files can be saved/restored symmetrically
+    os.makedirs(experiment_dir, exist_ok=True)
+    os.makedirs(checkpoint_dir, exist_ok=True)
 
     return experiment_dir, checkpoint_dir
+

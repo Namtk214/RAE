@@ -221,12 +221,16 @@ def train(config):
     repl_sharding = get_replicated_sharding(mesh)
 
     num_devices = jax.device_count()
+    num_processes = jax.process_count()
     global_batch_size = train_cfg.global_batch_size
     per_device_batch = global_batch_size // num_devices
+    per_host_batch = global_batch_size // num_processes  # each host reads this many
     assert global_batch_size % num_devices == 0, \
         f"Batch size {global_batch_size} not divisible by {num_devices} devices"
+    assert global_batch_size % num_processes == 0, \
+        f"Batch size {global_batch_size} not divisible by {num_processes} processes"
 
-    print(f"[Train] Global batch: {global_batch_size}, Per-device: {per_device_batch}")
+    print(f"[Train] Global batch: {global_batch_size}, Per-device: {per_device_batch}, Per-host: {per_host_batch}")
 
     # Experiment directories
     exp_dir, ckpt_dir = configure_experiment_dirs(
@@ -264,6 +268,8 @@ def train(config):
     lpips_model = LPIPS(rngs=nnx.Rngs(int(rng_lpips[0])))
 
     # --- Build data loader ---
+    # On multi-host TPU each process reads only per_host_batch rows.
+    # shard_batch() then assembles them into the global array.
     data_cfg = config.data
     train_iter = build_dataset(
         source=data_cfg.source,
@@ -271,9 +277,9 @@ def train(config):
         data_dir=data_cfg.get("data_dir"),
         tfds_builder_dir=data_cfg.get("tfds_builder_dir"),
         image_size=data_cfg.image_size,
-        batch_size=global_batch_size,
+        batch_size=per_host_batch,  # each host reads its own slice
         split="train",
-        seed=train_cfg.seed,
+        seed=train_cfg.seed + jax.process_index(),  # different shuffle per host
     )
     valid_split = "validation" if data_cfg.source == "tfds" else "val"
     val_iter = build_dataset(
@@ -282,9 +288,9 @@ def train(config):
         data_dir=data_cfg.get("data_dir"),
         tfds_builder_dir=data_cfg.get("tfds_builder_dir"),
         image_size=data_cfg.image_size,
-        batch_size=global_batch_size,
+        batch_size=per_host_batch,  # each host reads its own slice
         split=valid_split,
-        seed=train_cfg.seed,
+        seed=train_cfg.seed + jax.process_index(),
     )
 
     # --- Compute steps ---
@@ -420,7 +426,7 @@ def train(config):
                 for k, v in step_metrics.items():
                     metrics_history[k].append(float(v))
 
-                if (step + 1) % log_interval == 0 and jax.process_index() == 0:
+                if (step + 1) % log_interval == 0:
                     elapsed = time.time() - start_time
                     steps_per_sec = log_interval / elapsed
                     
@@ -439,40 +445,42 @@ def train(config):
                     rng, val_rng = jax.random.split(rng)
                     val_rec_loss, val_lpips = valid_step(ema_params, val_images, val_rng)
 
-                    summary = {
-                        f"train/{k}": sum(list(metrics_history[k])[-log_interval:]) / log_interval
-                        for k in metrics_history
-                    }
-                    summary["val/rec_loss"] = float(val_rec_loss)
-                    summary["val/lpips_loss"] = float(val_lpips)
-                    summary["train/steps_per_sec"] = steps_per_sec
-                    summary["train/epoch"] = epoch
-                    summary["train/step"] = step + 1
+                    if jax.process_index() == 0:
+                        summary = {
+                            f"train/{k}": sum(list(metrics_history[k])[-log_interval:]) / log_interval
+                            for k in metrics_history
+                        }
+                        summary["val/rec_loss"] = float(val_rec_loss)
+                        summary["val/lpips_loss"] = float(val_lpips)
+                        summary["train/steps_per_sec"] = steps_per_sec
+                        summary["train/epoch"] = epoch
+                        summary["train/step"] = step + 1
 
-                    print(f"[Step {step + 1}/{total_steps}] "
-                          f"epoch={epoch} "
-                          f"loss={summary.get('train/total_loss', 0):.4f} "
-                          f"rec={summary.get('train/rec_loss', 0):.4f} "
-                          f"lpips={summary.get('train/lpips_loss', 0):.4f} "
-                          f"g={summary.get('train/g_loss', 0):.4f} "
-                          f"d={summary.get('train/d_loss', 0):.4f} "
-                          f"dw={summary.get('train/d_weight', 0):.4f} "
-                          f"({steps_per_sec:.1f} steps/s)")
+                        print(f"[Step {step + 1}/{total_steps}] "
+                              f"epoch={epoch} "
+                              f"loss={summary.get('train/total_loss', 0):.4f} "
+                              f"rec={summary.get('train/rec_loss', 0):.4f} "
+                              f"lpips={summary.get('train/lpips_loss', 0):.4f} "
+                              f"g={summary.get('train/g_loss', 0):.4f} "
+                              f"d={summary.get('train/d_loss', 0):.4f} "
+                              f"dw={summary.get('train/d_weight', 0):.4f} "
+                              f"({steps_per_sec:.1f} steps/s)")
 
-                    if config.wandb.enabled:
-                        wandb_utils.log(summary, step=step + 1)
+                        if config.wandb.enabled:
+                            wandb_utils.log(summary, step=step + 1)
 
                     start_time = time.time()
 
                 # --- Sample (rare, OK to sync to host) ---
-                if (step + 1) % sample_every == 0 and jax.process_index() == 0:
+                if (step + 1) % sample_every == 0:
                     # Sync decoder params back for sampling only
                     nnx.update(rae_model.decoder, decoder_params)
                     sample_images = images[:8]
                     rng_sample, _ = jax.random.split(rng)
                     x_rec_sample = rae_model.forward(sample_images, rng=rng_sample, training=False)
-                    x_rec_np = np.array(x_rec_sample)
-                    wandb_utils.log_image(x_rec_np, key="reconstructions", step=step + 1)
+                    if jax.process_index() == 0:
+                        x_rec_np = np.array(x_rec_sample)
+                        wandb_utils.log_image(x_rec_np, key="reconstructions", step=step + 1)
 
                 step += 1
 

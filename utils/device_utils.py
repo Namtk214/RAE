@@ -31,16 +31,30 @@ def get_replicated_sharding(mesh: Mesh) -> NamedSharding:
 
 
 def shard_batch(batch: dict, mesh: Mesh, axis_name: str = "data") -> dict:
-    """Shard a batch dict along the data axis.
+    """Shard a batch dict along the data axis — multi-host correct.
 
-    Each array in the batch gets its first dimension split across devices.
+    On multi-host TPU (e.g. v4-16), each host reads only its local slice of
+    the global batch (global_batch // num_hosts rows). JAX then assembles
+    the per-host slices into one global sharded array via
+    make_array_from_process_local_data.
+
+    On single-host this degenerates to a simple device_put.
     """
     data_sharding = get_data_sharding(mesh, axis_name)
+    num_processes = jax.process_count()
 
     def _shard(x):
-        if isinstance(x, (jnp.ndarray, np.ndarray)):
+        if not isinstance(x, (jnp.ndarray, np.ndarray)):
+            return x
+        x = np.asarray(x)
+        if num_processes == 1:
+            # Single-host fast path
             return jax.device_put(jnp.array(x), data_sharding)
-        return x
+        # Multi-host: x is the local slice (global_batch / num_hosts rows).
+        # Use make_array_from_process_local_data so each host contributes
+        # its own rows without needing to agree on the full global tensor.
+        global_shape = (x.shape[0] * num_processes,) + x.shape[1:]
+        return jax.make_array_from_process_local_data(data_sharding, x, global_shape)
 
     return jax.tree.map(_shard, batch)
 

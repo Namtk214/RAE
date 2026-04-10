@@ -162,7 +162,10 @@ def evaluate_generation_distributed(
 
     rng = jax.random.PRNGKey(global_step * num_processes + process_index)
     generated = 0
-    num_local_devices = jax.local_device_count()
+
+    # Per-host batch: each host generates batch_size // num_processes samples,
+    # which are assembled into a global batch of batch_size via make_array_from_process_local_data
+    per_host_batch = max(1, batch_size // num_processes)
 
     # Collect activations (float32 [N, 2048]) — much smaller than images
     local_activations = []
@@ -171,22 +174,27 @@ def evaluate_generation_distributed(
     pbar = _tqdm(total=local_num, desc=f"Process {process_index} Gen+Inception") if is_main else None
 
     while generated < local_num:
-        n_raw = min(batch_size, local_num - generated)
+        n_raw = min(per_host_batch, local_num - generated)
         rng, noise_rng, label_rng = jax.random.split(rng, 3)
 
-        # Always full batch_size to keep JIT shape stable
-        z = jax.random.normal(noise_rng, (batch_size, *latent_size))
-        y = jax.random.randint(label_rng, (batch_size,), 0, num_classes)
+        # Each host generates its own local slice (different RNG → different samples)
+        z_local = np.array(jax.random.normal(noise_rng, (per_host_batch, *latent_size)))
+        y_local = np.array(jax.random.randint(label_rng, (per_host_batch,), 0, num_classes))
 
-        if data_sharding is not None and batch_size % num_local_devices == 0:
-            z = jax.device_put(z, data_sharding)
-            y = jax.device_put(y, data_sharding)
+        # Assemble into global sharded array (same pattern as shard_batch)
+        if data_sharding is not None:
+            global_z_shape = (per_host_batch * num_processes, *latent_size)
+            global_y_shape = (per_host_batch * num_processes,)
+            z = jax.make_array_from_process_local_data(data_sharding, z_local, global_z_shape)
+            y = jax.make_array_from_process_local_data(data_sharding, y_local, global_y_shape)
+        else:
+            z = jnp.array(z_local)
+            y = jnp.array(y_local)
 
-        # Sample latents
+        # Sample latents (all hosts participate in data-parallel JIT)
         samples = compiled_sample_fn(z, y)
-        samples = samples[:n_raw]
 
-        # Decode latents → images [0, 1] NHWC
+        # Decode latents → images [0, 1] NHWC (all hosts, data-parallel)
         if rae_decode_fn is not None:
             images = rae_decode_fn(samples)
             images = jnp.clip(images, 0.0, 1.0)
@@ -197,9 +205,13 @@ def evaluate_generation_distributed(
         if images.ndim == 4 and images.shape[1] in (1, 3, 4) and images.shape[-1] not in (1, 3, 4):
             images = jnp.transpose(images, (0, 2, 3, 1))
 
-        # Extract InceptionV3 activations ON-DEVICE (JAX JIT)
-        acts = inception_batch(images)  # [n_raw, 2048]
-        local_activations.append(np.array(acts))
+        # Extract InceptionV3 activations ON-DEVICE (JAX JIT, all hosts)
+        acts_global = inception_batch(images)  # global: [batch_size, 2048]
+
+        # Extract this host's local shard and convert to numpy
+        local_acts_shards = [np.array(s.data) for s in acts_global.addressable_shards]
+        acts_local = np.concatenate(local_acts_shards, axis=0)[:n_raw]
+        local_activations.append(acts_local)
 
         generated += n_raw
         if pbar is not None:

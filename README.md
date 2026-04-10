@@ -518,6 +518,103 @@ Mesh("data", 8)
 - **`donate_argnums`** for zero-copy parameter updates
 - **Gradient checkpointing** available via `nnx.remat` for large models
 
+### Multi-Host Training (TPU v4-16, v5e-16, etc.)
+
+When training on multi-host TPU pods (e.g., `v4-16` which comprises 2 VMs with 16 TPU cores total), JAX executes programs symmetrically on all workers. 
+
+**Execution Commands:**
+Run scripts on all workers simultaneously by passing `--worker=all`. To avoid the console freezing from SSH timeouts, run long processes in the background using `nohup`.
+
+**1. Stage 1 Training:**
+```bash
+nohup gcloud compute tpus tpu-vm ssh node-v4-16 --zone=us-central2-b --worker=all \
+  --command="cd ~/rae_jax/RAE && python train_stage1.py \
+    --data-dir ~/tensorflow_datasets \
+    --data-source tfds \
+    --dataset-name celebahq256 \
+    --num-train-samples 30000 \
+    --results-dir ckpts/stage1 \
+    --experiment-name celebahq256_dinov2b_decXL \
+    --epochs 16 \
+    --global-batch-size 128 \
+    --lr 2e-4 \
+    --wandb \
+    --wandb-project rae-jax-stage1" > train_stage1_run.log 2>&1 &
+```
+
+**2. Extract Decoder from Checkpoint:**
+```bash
+# This can be run on all workers so both hosts get the model.npz file locally
+gcloud compute tpus tpu-vm ssh node-v4-16 --zone=us-central2-b --worker=all \
+  --command="cd ~/rae_jax/RAE && mkdir -p models/decoders/dinov2/wReg_base/ViTXL_n08/ && \
+  python extract_decoder.py \
+    --config configs/stage1/training/DINOv2-B_decXL.yaml \
+    --ckpt ckpts/stage1/celebahq256_dinov2b_decXL/checkpoints/ckpt_0003744.pkl \
+    --use-ema \
+    --out models/decoders/dinov2/wReg_base/ViTXL_n08/model.npz"
+```
+
+**3. Calculate Normalization Stats:**
+```bash
+gcloud compute tpus tpu-vm ssh node-v4-16 --zone=us-central2-b --worker=all \
+  --command="cd ~/rae_jax/RAE && python calculate_stat.py \
+    --config configs/stage1/pretrained/DINOv2-B.yaml \
+    --data-path ~/tensorflow_datasets \
+    --output-dir models/stats/dinov2 \
+    --image-size 256 \
+    --batch-size 32 \
+    --num-samples 30000 \
+    --dataset-type tfds \
+    --tfds-name celebahq256"
+```
+
+> **Warning:** `calculate_stat.py` will only save the `.npz` file on **Worker 0**. Before running Stage 2, you MUST copy the `normalization_stats.npz` to all other workers:
+> ```bash
+> # Copy from Worker 0 to Worker 1
+> gcloud compute tpus tpu-vm ssh node-v4-16 --zone=us-central2-b --worker=0 --command="cat ~/rae_jax/RAE/models/stats/dinov2/normalization_stats.npz" | gcloud compute tpus tpu-vm ssh node-v4-16 --zone=us-central2-b --worker=1 --command="mkdir -p ~/rae_jax/RAE/models/stats/dinov2 && cat > ~/rae_jax/RAE/models/stats/dinov2/normalization_stats.npz"
+> ```
+
+**4. Stage 2 Training:**
+```bash
+nohup gcloud compute tpus tpu-vm ssh node-v4-16 --zone=us-central2-b --worker=all \
+  --command="cd ~/rae_jax/RAE && python train.py \
+    --data-path ~/tensorflow_datasets \
+    --dataset-type tfds \
+    --tfds-name celebahq256 \
+    --tfds-builder-dir ~/tensorflow_datasets/celebahq256/1.0.0 \
+    --num-train-samples 30000 \
+    --num-classes 1 \
+    --rae-checkpoint ckpts/stage1/celebahq256_dinov2b_decXL/checkpoints/ckpt_0003744.pkl \
+    --normalization-stat-path models/stats/dinov2/normalization_stats.npz \
+    --results-dir ckpts/stage2 \
+    --experiment-name celebahq256_s \
+    --epochs 200 \
+    --global-batch-size 128 \
+    --lr 2e-4 \
+    --wandb" > train_stage2_run.log 2>&1 &
+```
+
+**Syncing Code Across Workers:**
+If you edit code locally, you **MUST** sync the python files to all workers before training, otherwise workers will run out-of-sync code and crash/deadlock!
+```bash
+# Sync specific files that were modified across the slice
+gcloud compute tpus tpu-vm scp ~/rae_jax/RAE/train.py ~/rae_jax/RAE/calculate_stat.py ~/rae_jax/RAE/train_stage1.py node-v4-16:~/rae_jax/RAE/ --zone=us-central2-b --worker=all
+gcloud compute tpus tpu-vm scp ~/rae_jax/RAE/utils/device_utils.py node-v4-16:~/rae_jax/RAE/utils/device_utils.py --zone=us-central2-b --worker=all
+```
+
+**Force Killing Deadlocked Jobs:**
+If JAX encounters a synchronization mismatch (e.g., Worker 1 executes a JIT block but Worker 0 skipped it due to a logic bug), the processes will hang indefinitely at 0% CPU waiting for network handshakes. You must force kill them across all workers:
+```bash
+# Force kill stuck processes across all nodes
+gcloud compute tpus tpu-vm ssh node-v4-16 --zone=us-central2-b --worker=all --command="pkill -9 -f train_stage1.py"
+```
+
+### Multi-Host Deadlock Avoidance (Developer Note)
+The framework natively avoids multi-host deadlocks by using robust JAX multi-host data loading patterns:
+1. **Per-Host Batching**: Using `batch_size = global_batch_size // jax.process_count()` instead of loading the full tensor. Each worker reads only its unique dataset slice.
+2. **`make_array_from_process_local_data`**: Inside `utils/device_utils.py`, local data batches from each host are seamlessly materialized into a global `NamedSharding` array without the hosts needing identical full local instances.
+3. **Symmetric Execution**: Network collectives (`jax.jit`, `device_put`) are never gated behind `if jax.process_index() == 0:`. Gating is strictly reserved for pure IO ops (like `print()`, `wandb.log()`, `os.makedirs()`).
+
 ---
 
 ## Acknowledgements
